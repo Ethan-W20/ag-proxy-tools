@@ -16,7 +16,7 @@
 
 ---
 
-**AG Proxy Manager** 是一款基于 **Tauri v2**（Rust 后端 + 原生 JS 前端）构建的高性能桌面代理管理器，专为 AI 编程助手设计。它在本地建立一个 HTTPS 代理服务器，位于 IDE 与上游 Google Cloud Code API 之间，提供多账号轮换、配额感知的智能路由、请求链路追踪以及一键 IDE 集成——运行时无需任何外部依赖。
+**AG Proxy Manager** 是一款基于 **Tauri v2**（Rust 后端 + 原生 JS 前端）构建的高性能桌面代理管理器，专为 Antigravity IDE 设计。它在本地建立一个 HTTPS 代理服务器，位于 IDE 与上游 Google Cloud Code API 之间，提供多账号轮换、配额感知的智能路由、请求链路追踪以及一键 IDE 集成——运行时无需任何外部依赖，完全 在Antigravity 里使用额度，暂未发现封号情况。
 
 ---
 
