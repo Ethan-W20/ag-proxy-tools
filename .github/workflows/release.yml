@@ -15,24 +15,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows x64
+          # Windows x64 — native runner
           - platform: windows-latest
-            target: x86_64-pc-windows-msvc
             artifact-name: windows-x64
 
-          # macOS Intel (x86_64)
-          - platform: macos-latest
-            target: x86_64-apple-darwin
+          # macOS Intel (x86_64) — use macos-13 which is Intel runner
+          - platform: macos-13
             artifact-name: macos-intel
 
-          # macOS Apple Silicon (M1/M2/M3)
+          # macOS Apple Silicon (M1/M2/M3) — macos-latest is now ARM runner
           - platform: macos-latest
-            target: aarch64-apple-darwin
             artifact-name: macos-arm
 
-          # Linux x64
+          # Linux x64 — native runner
           - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
             artifact-name: linux-x64
 
     runs-on: ${{ matrix.platform }}
@@ -64,11 +60,9 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      # ── 4. Set up Rust ──────────────────────────────────────────
+      # ── 4. Set up Rust (native target, no cross-compilation) ────
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       # ── 5. Cache Rust build artifacts ───────────────────────────
       - name: Cache Rust build
@@ -80,7 +74,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # ── 7. Build with Tauri ─────────────────────────────────────
+      # ── 7. Build with Tauri (native — no --target flag) ─────────
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -93,4 +87,3 @@ jobs:
             See [RELEASE_NOTES.md](https://github.com/${{ github.repository }}/blob/main/RELEASE_NOTES.md) for full release notes / 完整发布说明。
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.target }}
