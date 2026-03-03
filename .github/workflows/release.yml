@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+# Required to create releases and upload assets
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     strategy:
