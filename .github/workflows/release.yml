@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64
+          - platform: windows-latest
+            args: '--target x86_64-pc-windows-msvc'
+            artifact-name: windows-x64
+
+          # macOS Intel (x86_64)
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            artifact-name: macos-intel
+
+          # macOS Apple Silicon (M1/M2/M3)
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            artifact-name: macos-arm
+
+          # Linux x64
+          - platform: ubuntu-22.04
+            args: '--target x86_64-unknown-linux-gnu'
+            artifact-name: linux-x64
+
+    runs-on: ${{ matrix.platform }}
+    name: Build (${{ matrix.artifact-name }})
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Install Linux system dependencies ───────────────────
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ── 3. Set up Node.js ───────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ── 4. Set up Rust ──────────────────────────────────────────
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      # ── 5. Cache Rust build artifacts ───────────────────────────
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      # ── 6. Install frontend dependencies ────────────────────────
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # ── 7. Build with Tauri ─────────────────────────────────────
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: inject OAuth client credentials via repository secrets
+          # (Set AG_PROXY_GOOGLE_CLIENT_ID and AG_PROXY_GOOGLE_CLIENT_SECRET
+          #  in repo Settings → Secrets and variables → Actions)
+          AG_PROXY_GOOGLE_CLIENT_SECRET: ${{ secrets.AG_PROXY_GOOGLE_CLIENT_SECRET }}
+          # macOS code signing (leave empty to skip signing)
+          APPLE_SIGNING_IDENTITY: ''
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: '${{ github.ref_name }} — AG Proxy Manager'
+          releaseBody: |
+            See [RELEASE_NOTES.md](https://github.com/${{ github.repository }}/blob/main/RELEASE_NOTES.md) for full changelog.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
