@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 
 use crate::cert::ensure_cert_exists;
 use crate::constants::{
-    get_client_secret, CLIENT_ID, TARGET_HOST_1, TARGET_HOST_2, TARGET_HOST_3, TOKEN_URL,
+    get_client_id, get_client_secret, TARGET_HOST_1, TARGET_HOST_2, TARGET_HOST_3, TOKEN_URL,
     USERINFO_URL,
 };
 use crate::models::{Account, AiProvider, AppState, QuotaData, QuotaErrorInfo};
@@ -33,9 +33,10 @@ pub(crate) use crate::proxy_error::{
 
 pub async fn do_refresh_token(refresh_token: &str) -> Result<(String, i64), String> {
     let client = reqwest::Client::new();
+    let client_id = get_client_id()?;
     let client_secret = get_client_secret()?;
     let params = [
-        ("client_id", CLIENT_ID),
+        ("client_id", client_id.as_str()),
         ("client_secret", client_secret.as_str()),
         ("refresh_token", refresh_token),
         ("grant_type", "refresh_token"),
@@ -865,6 +866,13 @@ fn maybe_patch_project_in_body(
     let Some(project_resource) = project_resource else {
         return body_bytes.clone();
     };
+    let pid = project_resource
+        .strip_prefix("projects/")
+        .unwrap_or(project_resource);
+    if pid.is_empty() {
+        return body_bytes.clone();
+    }
+
     let mut value = match serde_json::from_slice::<serde_json::Value>(body_bytes) {
         Ok(v) => v,
         Err(_) => {
@@ -872,20 +880,30 @@ fn maybe_patch_project_in_body(
                 if let Some(patched) =
                     patch_name_project_placeholder_in_raw_json(raw, project_resource)
                 {
-                    return Bytes::from(patched.into_bytes());
+                    let result = Bytes::from(patched.into_bytes());
+                    return ensure_project_in_body_raw(&result, pid);
                 }
+            }
+            // For non-JSON bodies, avoid aggressive global replacement by default.
+            // Keep payload close to original unless explicitly forced.
+            if is_truthy_env("AG_PROXY_FORCE_PROJECT_REWRITE") {
+                return ensure_project_in_body_raw(body_bytes, pid);
             }
             return body_bytes.clone();
         }
     };
-    if !replace_empty_project_placeholders(&mut value, project_resource) {
-        let (patched_body, changed) =
-            patch_name_project_placeholder_in_body(body_bytes, Some(project_resource));
-        if changed {
-            return patched_body;
-        }
-        return body_bytes.clone();
+
+    let has_empty_placeholders = contains_empty_project_placeholders(&value);
+    let force_project_rewrite = is_truthy_env("AG_PROXY_FORCE_PROJECT_REWRITE");
+    if has_empty_placeholders || force_project_rewrite {
+        // Step 1: Replace empty project placeholders
+        let _ = replace_empty_project_placeholders(&mut value, project_resource);
+
+        // Step 2: Replace mismatched project IDs in resource paths.
+        // Only do this by default when placeholders were detected.
+        replace_project_in_resource_paths(&mut value, pid);
     }
+
     let serialized = serde_json::to_vec(&value)
         .map(Bytes::from)
         .unwrap_or_else(|_| body_bytes.clone());
@@ -895,6 +913,61 @@ fn maybe_patch_project_in_body(
         return patched_body;
     }
     serialized
+}
+
+/// Replace project ID in resource path strings like "projects/OLD_ID/locations/..."
+/// with the correct project ID for the selected account.
+fn replace_project_in_resource_paths(value: &mut serde_json::Value, correct_pid: &str) {
+    static PROJECT_PATH_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PROJECT_PATH_RE.get_or_init(|| {
+        regex::Regex::new(r#"projects/([^/\s"]+)(/locations/)"#).unwrap()
+    });
+
+    match value {
+        serde_json::Value::String(s) => {
+            if s.contains("projects/") && s.contains("/locations/") {
+                let replaced = re.replace_all(s, |_caps: &regex::Captures| {
+                    format!("projects/{}/locations/", correct_pid)
+                });
+                if replaced != *s {
+                    *s = replaced.into_owned();
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                replace_project_in_resource_paths(v, correct_pid);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                replace_project_in_resource_paths(item, correct_pid);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fallback: replace project in raw body bytes when JSON parsing fails.
+fn ensure_project_in_body_raw(body_bytes: &Bytes, correct_pid: &str) -> Bytes {
+    static RAW_PROJECT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let Ok(raw) = std::str::from_utf8(body_bytes) else {
+        return body_bytes.clone();
+    };
+    if !raw.contains("projects/") {
+        return body_bytes.clone();
+    }
+    let re = RAW_PROJECT_RE.get_or_init(|| {
+        regex::Regex::new(r#"projects/([^/\s"]*)/locations/"#).unwrap()
+    });
+    let replaced = re.replace_all(raw, |_caps: &regex::Captures| {
+        format!("projects/{}/locations/", correct_pid)
+    });
+    if replaced != raw {
+        Bytes::from(replaced.into_owned().into_bytes())
+    } else {
+        body_bytes.clone()
+    }
 }
 
 pub(crate) async fn fetch_project_resource_with_token(access_token: &str) -> Option<String> {
@@ -1033,6 +1106,17 @@ fn should_skip_forward_header(name: &HeaderName) -> bool {
         || n.eq_ignore_ascii_case("authorization")
 }
 
+fn is_truthy_env(var_name: &str) -> bool {
+    matches!(
+        std::env::var(var_name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn build_upstream_request(
     client: &reqwest::Client,
     method: &http::Method,
@@ -1041,6 +1125,7 @@ fn build_upstream_request(
     body_bytes: &Bytes,
     access_token: &str,
     header_passthrough: bool,
+    preserve_incoming_user_agent: bool,
     http_protocol_mode: &str,
     authorization_override: Option<&str>,
 ) -> reqwest::RequestBuilder {
@@ -1053,13 +1138,16 @@ fn build_upstream_request(
         if should_skip_forward_header(name) {
             continue;
         }
-        if !header_passthrough && name.as_str().eq_ignore_ascii_case("user-agent") {
+        if !header_passthrough
+            && !preserve_incoming_user_agent
+            && name.as_str().eq_ignore_ascii_case("user-agent")
+        {
             continue;
         }
         req_builder = req_builder.header(name, value);
     }
 
-    if !header_passthrough {
+    if !header_passthrough && !preserve_incoming_user_agent {
         req_builder = req_builder.header("User-Agent", "antigravity");
     }
 
@@ -1179,6 +1267,8 @@ fn emit_request_summary_log(
     status: u16,
     elapsed_ms: u128,
     flow_details: FlowDetailBundle,
+    flow_id: &str,
+    flow_timestamp: &str,
 ) {
     let log_type = if (200..300).contains(&(status as i32)) { "dim" } else { "warning" };
     emit_log(
@@ -1195,6 +1285,7 @@ fn emit_request_summary_log(
     use crate::models::{FlowHop, RequestFlowPayload};
     let is_success = (200..300).contains(&(status as i32));
     let is_gateway = mode == "client_gateway" || mode == "gateway";
+    let is_ls = mode == "official_ls";
 
     let fwd_status = Some(status);
     let ret_status = Some(status);
@@ -1203,11 +1294,11 @@ fn emit_request_summary_log(
     let d_upstream_to_local = flow_details.upstream_to_local.clone();
     let d_local_to_client = flow_details.local_to_client.clone();
 
-    let (forward_hops, return_hops) = if is_gateway {
+    let (forward_hops, return_hops) = if is_gateway || is_ls {
         (
             vec![
                 FlowHop {
-                    node: "客户端".into(),
+                    node: "IDE".into(),
                     status: Some(200),
                     detail: None,
                 },
@@ -1217,17 +1308,12 @@ fn emit_request_summary_log(
                     detail: d_client_to_local.clone(),
                 },
                 FlowHop {
-                    node: "网关".into(),
+                    node: if is_ls { "官方LS".into() } else { "网关".into() },
                     status: Some(200),
                     detail: d_local_to_upstream.clone(),
                 },
                 FlowHop {
-                    node: "LS桥接".into(),
-                    status: Some(200),
-                    detail: d_local_to_upstream.clone(),
-                },
-                FlowHop {
-                    node: "上游官方".into(),
+                    node: "上游".into(),
                     status: fwd_status,
                     detail: d_local_to_upstream
                         .clone()
@@ -1236,17 +1322,12 @@ fn emit_request_summary_log(
             ],
             vec![
                 FlowHop {
-                    node: "上游官方".into(),
+                    node: "上游".into(),
                     status: ret_status,
                     detail: d_upstream_to_local.clone(),
                 },
                 FlowHop {
-                    node: "LS桥接".into(),
-                    status: ret_status,
-                    detail: d_upstream_to_local.clone(),
-                },
-                FlowHop {
-                    node: "网关".into(),
+                    node: if is_ls { "官方LS".into() } else { "网关".into() },
                     status: ret_status,
                     detail: d_upstream_to_local.clone(),
                 },
@@ -1258,7 +1339,7 @@ fn emit_request_summary_log(
                         .or_else(|| d_upstream_to_local.clone()),
                 },
                 FlowHop {
-                    node: "客户端".into(),
+                    node: "IDE".into(),
                     status: ret_status,
                     detail: d_local_to_client.clone(),
                 },
@@ -1268,7 +1349,7 @@ fn emit_request_summary_log(
         (
             vec![
                 FlowHop {
-                    node: "客户端".into(),
+                    node: "IDE".into(),
                     status: Some(200),
                     detail: None,
                 },
@@ -1278,14 +1359,14 @@ fn emit_request_summary_log(
                     detail: d_client_to_local,
                 },
                 FlowHop {
-                    node: "上游官方".into(),
+                    node: "上游".into(),
                     status: fwd_status,
                     detail: d_local_to_upstream.or_else(|| Some(format!("target={}", target))),
                 },
             ],
             vec![
                 FlowHop {
-                    node: "上游官方".into(),
+                    node: "上游".into(),
                     status: ret_status,
                     detail: d_upstream_to_local.clone(),
                 },
@@ -1297,7 +1378,7 @@ fn emit_request_summary_log(
                         .or_else(|| d_upstream_to_local.clone()),
                 },
                 FlowHop {
-                    node: "客户端".into(),
+                    node: "IDE".into(),
                     status: ret_status,
                     detail: d_local_to_client,
                 },
@@ -1305,13 +1386,17 @@ fn emit_request_summary_log(
         )
     };
 
+    let phase = if is_success { "completed" } else { "error" };
+
     let flow = RequestFlowPayload {
-        id: format!("{}", uuid::Uuid::new_v4()),
-        timestamp: Utc::now().format("%H:%M:%S").to_string(),
+        id: flow_id.to_string(),
+        timestamp: flow_timestamp.to_string(),
         method: method.to_string(),
         path: path_query.to_string(),
         account: account.to_string(),
-        mode: if is_gateway { "网关".into() } else { "proxy".into() },
+        mode: if is_gateway { "网关".into() } else if is_ls { "official_ls".into() } else { "direct".into() },
+        phase: phase.to_string(),
+        target: Some(target.to_string()),
         forward_hops,
         return_hops,
         final_status: Some(status),
@@ -1458,6 +1543,110 @@ fn estimate_flow_body_tokens(body: &[u8]) -> usize {
     }
 }
 
+fn header_value_or_dash(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn req_header_value_or_dash(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn short_body_hash_hex(body: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = OFFSET_BASIS;
+    for b in body {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}", hash)
+}
+
+fn first_body_diff_offset(original: &[u8], forwarded: &[u8]) -> Option<usize> {
+    let limit = original.len().min(forwarded.len());
+    for i in 0..limit {
+        if original[i] != forwarded[i] {
+            return Some(i);
+        }
+    }
+    if original.len() != forwarded.len() {
+        Some(limit)
+    } else {
+        None
+    }
+}
+
+fn build_request_compare_details(
+    method: &http::Method,
+    path_query: &str,
+    target_label: &str,
+    original_target_url: &str,
+    patched_target_url: &str,
+    attempt_idx: usize,
+    attempt_total: usize,
+    attempt_model: &str,
+    incoming_headers: &HeaderMap,
+    built_req: &reqwest::Request,
+    original_body: &[u8],
+    forwarded_body: &[u8],
+    header_passthrough: bool,
+    preserve_incoming_user_agent: bool,
+    stream_auth_passthrough: bool,
+    project_name_placeholder_fixed: bool,
+    base_project_body_rewritten: bool,
+) -> String {
+    let upstream_path_query = built_req
+        .url()
+        .query()
+        .map(|q| format!("{}?{}", built_req.url().path(), q))
+        .unwrap_or_else(|| built_req.url().path().to_string());
+
+    let compare_json = serde_json::json!({
+        "kind": "request_compare",
+        "method": method.to_string(),
+        "path": path_query,
+        "target": target_label,
+        "target_url": patched_target_url,
+        "upstream_path": upstream_path_query,
+        "attempt": attempt_idx + 1,
+        "attempt_total": attempt_total,
+        "model": attempt_model,
+        "body_original_bytes": original_body.len(),
+        "body_forward_bytes": forwarded_body.len(),
+        "body_original_hash": short_body_hash_hex(original_body),
+        "body_forward_hash": short_body_hash_hex(forwarded_body),
+        "body_changed": original_body != forwarded_body,
+        "first_diff_at": first_body_diff_offset(original_body, forwarded_body),
+        "rewrite": {
+            "project_in_path_rewritten": patched_target_url != original_target_url,
+            "project_body_rewritten_base": base_project_body_rewritten,
+            "project_name_placeholder_fixed": project_name_placeholder_fixed,
+            "header_passthrough": header_passthrough,
+            "preserve_incoming_user_agent": preserve_incoming_user_agent,
+            "stream_auth_passthrough": stream_auth_passthrough
+        },
+        "headers": {
+            "incoming_user_agent": header_value_or_dash(incoming_headers, "user-agent"),
+            "upstream_user_agent": req_header_value_or_dash(built_req.headers(), "user-agent"),
+            "incoming_content_type": header_value_or_dash(incoming_headers, "content-type"),
+            "upstream_content_type": req_header_value_or_dash(built_req.headers(), "content-type"),
+            "incoming_host": header_value_or_dash(incoming_headers, "host"),
+            "upstream_host": built_req.url().host_str().unwrap_or("-")
+        }
+    });
+
+    serde_json::to_string(&compare_json).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn non_empty_or_dash(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1518,6 +1707,35 @@ fn build_flow_diag_block(
     )
 }
 
+// ==================== Context window limits per model ====================
+
+/// Return the maximum context window (in tokens) for a given model name.
+/// Used by the /context-info endpoint to let the IDE ring indicator know how full the window is.
+fn context_window_limit(model: &str) -> u64 {
+    let m = model.to_lowercase();
+    // Gemini 2.x models — 1M or 2M depending on variant
+    if m.contains("gemini-2") || m.contains("gemini-exp") {
+        if m.contains("flash") {
+            return 1_048_576; // 1M
+        }
+        return 2_097_152; // 2M for pro / ultra
+    }
+    // Gemini 1.x models
+    if m.contains("gemini-1") || m.contains("gemini-pro") {
+        return 1_048_576; // 1M
+    }
+    // Gemini generic fallback
+    if m.contains("gemini") {
+        return 1_048_576;
+    }
+    // Claude models — 200K
+    if m.contains("claude") {
+        return 200_000;
+    }
+    // Default for unknown Google models / code assist
+    200_000
+}
+
 // ==================== Token usage recording ====================
 
 struct UsageRecorder {
@@ -1525,6 +1743,7 @@ struct UsageRecorder {
     app: tauri::AppHandle,
     email: String,
     model: String,
+    flow_id: String,
 }
 
 impl Drop for UsageRecorder {
@@ -1539,6 +1758,8 @@ impl Drop for UsageRecorder {
             {
                 let email = std::mem::take(&mut self.email);
                 let model = std::mem::take(&mut self.model);
+                let flow_id = std::mem::take(&mut self.flow_id);
+                let model_for_ctx = model.clone();
                 emit_log(
                     &self.app,
                     &format!(
@@ -1560,6 +1781,29 @@ impl Drop for UsageRecorder {
                         cache_creation_tokens: cache_creation,
                         total_tokens: total,
                     });
+                // Emit usage to frontend so flow entry can display real token counts
+                if !flow_id.is_empty() {
+                    let _ = self.app.emit("flow-usage", serde_json::json!({
+                        "flow_id": flow_id,
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_read_tokens": cache_read,
+                        "cache_creation_tokens": cache_creation,
+                        "total_tokens": total,
+                    }));
+                }
+                // Update last_context_usage for the /context-info endpoint
+                // Push new entry and prune old ones using configurable window
+                let window_secs = *app_state.context_ring_window_secs.lock().unwrap();
+                if let Ok(mut ctx) = app_state.last_context_usage.lock() {
+                    let now = Utc::now().timestamp();
+                    ctx.push((input, model_for_ctx.clone(), now));
+                    ctx.retain(|&(_, _, ts)| now - ts < window_secs as i64);
+                }
+                // Always update the latest entry (never expires, prevents 0 bug)
+                if let Ok(mut latest) = app_state.context_usage_latest.lock() {
+                    *latest = (input, model_for_ctx);
+                }
             }
         }
     }
@@ -1697,18 +1941,12 @@ async fn handle_proxy_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string());
     let stream_auth_passthrough = path_query.contains(":streamGenerateContent")
-        && matches!(
-            std::env::var("AG_PROXY_STREAM_AUTH_PASSTHROUGH")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        )
+        && is_truthy_env("AG_PROXY_STREAM_AUTH_PASSTHROUGH")
         && incoming_authorization
             .as_deref()
             .map(|s| s.to_ascii_lowercase().starts_with("bearer "))
             .unwrap_or(false);
+    let is_stream_generate_request = path_query.contains(":streamGenerateContent");
     let incoming_auth_header = req
         .headers()
         .get("authorization")
@@ -1762,6 +2000,59 @@ async fn handle_proxy_request(
     } else {
         "direct".to_string()
     };
+
+    // Generate unique flow ID for real-time tracking across phases
+    let flow_id = uuid::Uuid::new_v4().to_string();
+    let flow_timestamp = Utc::now().format("%H:%M:%S").to_string();
+
+    // ---- /context-info endpoint for IDE injected ring indicator ----
+    if path_query == "/context-info" || path_query.starts_with("/context-info?") {
+        use tauri::Manager;
+        let (input_tokens, model_name) = {
+            if let Some(app_state) = app.try_state::<crate::models::AppState>() {
+                let window_secs = *app_state.context_ring_window_secs.lock().unwrap();
+                let mut entries = app_state.last_context_usage.lock().unwrap();
+                let now = Utc::now().timestamp();
+                entries.retain(|&(_, _, ts)| now - ts < window_secs as i64);
+                if let Some(max_entry) = entries.iter().max_by_key(|e| e.0) {
+                    (max_entry.0, max_entry.1.clone())
+                } else {
+                    // Window empty — use the latest entry as fallback (prevents 0 bug)
+                    app_state.context_usage_latest.lock().unwrap().clone()
+                }
+            } else {
+                (0u64, String::new())
+            }
+        };
+        let max_context = context_window_limit(&model_name);
+        let json_body = serde_json::json!({
+            "input_tokens": input_tokens,
+            "model": model_name,
+            "max_context": max_context,
+        });
+        return Ok(http::Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(full_body(Bytes::from(json_body.to_string())))
+            .unwrap());
+    }
+
+    // ---- /auto-accept-config endpoint for IDE injected auto-accept script ----
+    if path_query == "/auto-accept-config" || path_query.starts_with("/auto-accept-config?") {
+        use tauri::Manager;
+        let config_json = if let Some(app_state) = app.try_state::<crate::models::AppState>() {
+            app_state.auto_accept_config.lock().unwrap().clone()
+        } else {
+            "{}".to_string()
+        };
+        return Ok(http::Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(full_body(Bytes::from(config_json)))
+            .unwrap());
+    }
 
     if path_query.starts_with("/api/update/") {
         return Ok(http::Response::builder()
@@ -1929,6 +2220,7 @@ async fn handle_proxy_request(
     let is_telemetry = path_query.contains("/v1internal:recordCodeAssistMetrics")
         || path_query.contains("/v1internal:recordTrajectoryAnalytics")
         || path_query.contains("/v1internal:fetchUserInfo")
+        || path_query.contains("/v1internal:fetchAdminControls")
         || path_query.contains("/v1internal/cascadeNuxes")
         || is_log_upload;
 
@@ -1990,7 +2282,14 @@ async fn handle_proxy_request(
     let url_needs_project = path_query.contains("projects//");
     let body_needs_project =
         should_fix_project_placeholder(&path_query) && body_contains_empty_project_placeholders(&body_bytes);
-    let request_needs_project = url_needs_project || body_needs_project;
+    // Optional compatibility switch: force project patching on critical endpoints.
+    // Disabled by default to keep request payloads closer to the original IDE request.
+    let path_always_needs_project = is_truthy_env("AG_PROXY_FORCE_PROJECT_REWRITE")
+        && (path_query.contains(":streamGenerateContent")
+            || path_query.contains(":generateContent")
+            || path_query.contains(":countTokens")
+            || path_query.contains(":loadCodeAssist"));
+    let request_needs_project = url_needs_project || body_needs_project || path_always_needs_project;
     let mut skipped_for_missing_project: Vec<String> = Vec::new();
     let mut attempted_upstream_forward = false;
 
@@ -2168,6 +2467,7 @@ async fn handle_proxy_request(
                     &attempt_body,
                     &token,
                     header_passthrough,
+                    is_stream_generate_request,
                     &http_protocol_mode,
                     if stream_auth_passthrough {
                         incoming_authorization.as_deref()
@@ -2207,6 +2507,37 @@ async fn handle_proxy_request(
                 let upstream_preview =
                     format_upstream_request_preview(&built_req, &target.label, attempt_body.len());
                 upstream_request_preview_for_flow = Some(upstream_preview.clone());
+
+                if is_stream_generate_request {
+                    let compare_details = build_request_compare_details(
+                        &method,
+                        &path_query,
+                        &target.label,
+                        &target.target_url,
+                        &patched_url,
+                        attempt_idx,
+                        capacity_attempts_len,
+                        &attempt_model_text,
+                        &incoming_headers,
+                        &built_req,
+                        body_bytes.as_ref(),
+                        attempt_body.as_ref(),
+                        header_passthrough,
+                        is_stream_generate_request,
+                        stream_auth_passthrough,
+                        patched_name_placeholder,
+                        body_for_upstream.as_ref() != body_bytes.as_ref(),
+                    );
+                    let compare_message = format!(
+                        "Request compare [{} {}] target={} attempt={}/{}",
+                        method,
+                        path_query,
+                        target.label,
+                        attempt_idx + 1,
+                        capacity_attempts_len
+                    );
+                    emit_log(&app, &compare_message, "dim", Some(compare_details.as_str()));
+                }
 
                 if verbose_header_logging_enabled() {
                     emit_log(
@@ -2422,12 +2753,15 @@ response: stream (SSE)
                                 upstream_to_local: Some(upstream_response_detail),
                                 local_to_client: Some(local_response_detail),
                             },
+                            &flow_id,
+                            &flow_timestamp,
                         );
                         let recorder = Arc::new(Mutex::new(UsageRecorder {
                             collected: Vec::new(),
                             app: app.clone(),
                             email: selected_email.clone(),
                             model: attempt_model_for_usage.clone().unwrap_or_default(),
+                            flow_id: flow_id.clone(),
                         }));
                         let recorder_ref = recorder.clone();
                         let byte_stream = resp.bytes_stream().map(move |result| {
@@ -2527,6 +2861,8 @@ response_body:
                             upstream_to_local: Some(upstream_response_detail),
                             local_to_client: Some(local_response_detail),
                         },
+                        &flow_id,
+                        &flow_timestamp,
                     );
                     return Ok(builder.body(full_body(resp_body)).unwrap());
                 }
@@ -2789,6 +3125,8 @@ response_body:
                             status.as_u16(),
                             request_started.elapsed().as_millis(),
                             non_success_details,
+                            &flow_id,
+                            &flow_timestamp,
                         );
                         return Ok(non_success_response);
                     }
@@ -2814,6 +3152,8 @@ response_body:
                 resp.status().as_u16(),
                 request_started.elapsed().as_millis(),
                 pending_non_success_details.unwrap_or_default(),
+                &flow_id,
+                &flow_timestamp,
             );
             return Ok(resp);
         }
@@ -2897,6 +3237,8 @@ reason: 所有上游目标请求失败",
                     request_started.elapsed().as_millis()
                 )),
             },
+            &flow_id,
+            &flow_timestamp,
         );
         return Ok(http::Response::builder()
             .status(502)
@@ -2945,6 +3287,8 @@ reason: 所有上游目标请求失败",
                     request_started.elapsed().as_millis()
                 )),
             },
+            &flow_id,
+            &flow_timestamp,
         );
         return Ok(http::Response::builder()
             .status(400)
@@ -3009,6 +3353,8 @@ reason: no available account or all accounts blocked",
                 request_started.elapsed().as_millis()
             )),
         },
+        &flow_id,
+        &flow_timestamp,
     );
     Ok(http::Response::builder()
         .status(502)
@@ -3061,10 +3407,13 @@ pub async fn start_proxy(
     let key = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| e.to_string())?
         .ok_or("private key not found in cert files".to_string())?;
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| e.to_string())?;
+    // Advertise both h2 and http/1.1 via ALPN so that IDE/Node.js clients
+    // can negotiate HTTP/2 or HTTP/1.1 during TLS handshake.
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -3084,9 +3433,31 @@ pub async fn start_proxy(
     let quota_threshold = state.quota_threshold.clone();
 
     let listen_port = load_port_config().unwrap_or(9527);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
-        .await
-        .map_err(|e| format!("Failed to bind 127.0.0.1:{}: {}", listen_port, e))?;
+
+    // Use socket2 to set SO_REUSEADDR, allowing bind even if port is in ghost/TIME_WAIT state
+    let listener = {
+        use socket2::{Socket, Domain, Type, Protocol};
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|e| format!("创建 socket 失败: {}", e))?;
+        socket.set_reuse_address(true)
+            .map_err(|e| format!("设置 SO_REUSEADDR 失败: {}", e))?;
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", listen_port).parse().unwrap();
+        socket.bind(&addr.into())
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    format!("端口 {} 已被占用且无法复用。\n请在设置中点击「释放端口」或更换端口后重试。", listen_port)
+                } else {
+                    format!("无法绑定 127.0.0.1:{}: {}", listen_port, e)
+                }
+            })?;
+        socket.listen(128)
+            .map_err(|e| format!("监听失败: {}", e))?;
+        socket.set_nonblocking(true)
+            .map_err(|e| format!("设置非阻塞失败: {}", e))?;
+        let std_listener: std::net::TcpListener = socket.into();
+        tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|e| format!("转换 tokio listener 失败: {}", e))?
+    };
 
     tokio::spawn(async move {
         *proxy_running.lock().unwrap() = true;
@@ -3117,7 +3488,8 @@ pub async fn start_proxy(
                         let quota_threshold = quota_threshold.clone();
 
                         tokio::spawn(async move {
-                            if let Ok(tls_stream) = acceptor.accept(stream).await {
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
                                 let app_for_service = app_inner.clone();
                                 let providers_inner = providers.clone();
                                 let routing_strategy_inner = routing_strategy.clone();
@@ -3154,6 +3526,10 @@ pub async fn start_proxy(
                                     .await
                                 {
                                     emit_log(&app_inner, &format!("连接处理失败: {:?}", err), "error", None);
+                                }
+                                }
+                                Err(tls_err) => {
+                                    emit_log(&app_inner, &format!("TLS 握手失败: {:?}", tls_err), "error", None);
                                 }
                             }
                         });
@@ -3199,6 +3575,83 @@ pub fn load_port_config() -> Result<u16, String> {
         return Err(format!("保存的端口无效: {}", port));
     }
     Ok(port)
+}
+
+#[tauri::command]
+pub fn kill_port_process(port: u16) -> Result<String, String> {
+    // Use netstat to find PID using the port
+    let output = std::process::Command::new("netstat")
+        .args(&["-ano"])
+        .output()
+        .map_err(|e| format!("无法执行 netstat: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let target = format!("127.0.0.1:{}", port);
+    let target2 = format!("0.0.0.0:{}", port);
+
+    let mut found_pids = Vec::new();
+    let mut killed_pids = Vec::new();
+    let mut ghost_port = false;
+
+    for line in stdout.lines() {
+        if (line.contains(&target) || line.contains(&target2)) && line.contains("LISTENING") {
+            if let Some(pid_str) = line.split_whitespace().last() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if pid > 0 && !found_pids.contains(&pid) {
+                        found_pids.push(pid);
+                        // Try to kill the process
+                        let kill_result = std::process::Command::new("taskkill")
+                            .args(&["/F", "/PID", &pid.to_string()])
+                            .output();
+                        match kill_result {
+                            Ok(r) if r.status.success() => {
+                                killed_pids.push(pid);
+                            }
+                            _ => {
+                                // Process might be dead but port is still held (ghost port)
+                                ghost_port = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if found_pids.is_empty() {
+        return Ok(format!("端口 {} 当前没有被占用", port));
+    }
+
+    if !killed_pids.is_empty() {
+        // Wait a bit for port to be released
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        return Ok(format!("已结束占用端口 {} 的进程 (PID: {:?})", port, killed_pids));
+    }
+
+    if ghost_port {
+        // Ghost port: process is dead but port is stuck. Try resetting winnat.
+        let stop = std::process::Command::new("net")
+            .args(&["stop", "winnat"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let start = std::process::Command::new("net")
+            .args(&["start", "winnat"])
+            .output();
+
+        match (stop, start) {
+            (Ok(s), Ok(r)) if s.status.success() && r.status.success() => {
+                Ok(format!("端口 {} 的幽灵占用已通过重置网络栈释放 (PID {} 已不存在)", port, found_pids[0]))
+            }
+            _ => {
+                Err(format!(
+                    "端口 {} 被已退出的进程 (PID {:?}) 锁定，自动释放失败。\n请以管理员身份在命令行执行：\nnet stop winnat && net start winnat\n然后重试。",
+                    port, found_pids
+                ))
+            }
+        }
+    } else {
+        Err(format!("端口 {} 被占用但无法释放 (PID: {:?})", port, found_pids))
+    }
 }
 
 #[tauri::command]

@@ -16,6 +16,7 @@ use models::AppState;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 use utils::get_app_data_dir;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -101,6 +102,10 @@ pub fn run() {
                 token_stats: token_stats::TokenStatsManager::new(),
                 quota_threshold: Arc::new(Mutex::new(saved_threshold)),
                 quota_cache: Arc::new(Mutex::new(HashMap::new())),
+                last_context_usage: Arc::new(Mutex::new(Vec::new())),
+                context_usage_latest: Arc::new(Mutex::new((0, String::new()))),
+                context_ring_window_secs: Arc::new(Mutex::new(15)),
+                auto_accept_config: Arc::new(Mutex::new(r#"{"enabled":true,"patterns":{"retry":false,"run":true,"apply":true,"execute":true,"confirm":false,"allow":true,"accept":true},"bannedCommands":["rm -rf /","rm -rf ~","rm -rf *","format c:","del /f /s /q","rmdir /s /q",":(){:|:&};:","dd if=","mkfs.","> /dev/sda","chmod -R 777 /"]}"#.to_string())),
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -115,12 +120,15 @@ pub fn run() {
             account::switch_account,
             account::delete_account,
             account::import_credential_files,
+            account::sync_accounts_from_legacy_projects,
             account::import_refresh_token,
             account::start_oauth_login,
             account::toggle_account_disabled,
             proxy::start_proxy,
             proxy::stop_proxy,
             proxy::save_port_config,
+            proxy::load_port_config,
+            proxy::kill_port_process,
             provider::save_providers,
             provider::load_saved_providers,
             quota::fetch_quota,
@@ -148,7 +156,44 @@ pub fn run() {
             proxy::set_quota_threshold,
             proxy::get_quota_threshold,
             proxy::flush_token_stats,
+            patch::check_auto_accept_status,
+            patch::apply_auto_accept,
+            patch::remove_auto_accept,
+            patch::check_context_ring_status,
+            patch::apply_context_ring,
+            patch::remove_context_ring,
+            patch::toggle_context_ring,
+            patch::get_context_ring_window,
+            patch::set_context_ring_window,
+            patch::update_auto_accept_config,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            // Stop proxy when the main window is closed
+            let app_handle = app.handle().clone();
+            if let Some(window) = app.get_webview_window("main") {
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Destroyed = event {
+                        // Send shutdown signal to proxy
+                        let state = app_handle.state::<AppState>();
+                        if let Some(tx) = state.proxy_shutdown_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        *state.proxy_running.lock().unwrap() = false;
+                    }
+                });
+            }
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Final cleanup: stop proxy on app exit
+                let state = app_handle.state::<AppState>();
+                let tx = state.proxy_shutdown_tx.lock().unwrap().take();
+                if let Some(tx) = tx {
+                    let _ = tx.send(());
+                }
+            }
+        });
 }

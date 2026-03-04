@@ -51,14 +51,6 @@
           </svg>
           <span id="navAccountsLabel">账号管理</span>
         </button>
-        <button class="nav-item" data-page="providers" onclick="switchPage('providers')">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 2L2 7l10 5 10-5-10-5z" />
-            <path d="M2 17l10 5 10-5" />
-            <path d="M2 12l10 5 10-5" />
-          </svg>
-          <span id="navProvidersLabel">AI 供应商</span>
-        </button>
         <button class="nav-item" data-page="tools" onclick="switchPage('tools')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path
@@ -93,7 +85,8 @@
         </button>
       </div>
       <div class="sidebar-footer">
-        <div class="proxy-status" id="proxyStatusIndicator">
+        <div class="proxy-status" id="proxyStatusIndicator" onclick="toggleProxy()" style="cursor:pointer;"
+          title="点击启动/停止代理">
           <span class="status-dot offline"></span>
           <span class="status-text" id="sidebarProxyStatus">代理未启动</span>
         </div>
@@ -161,6 +154,8 @@
                   id="dashInputTokens">0</strong></span>
               <span class="stat-subline"><span id="dashOutputLabel">输出</span> <strong
                   id="dashOutputTokens">0</strong></span>
+              <span class="stat-subline"><span id="dashCacheLabel">缓存</span> <strong
+                  id="dashCacheTokens">0</strong></span>
             </div>
           </div>
         </div>
@@ -230,6 +225,7 @@
               </button>
               <div class="import-menu" id="importMenu">
                 <button onclick="importFromFiles()"><span id="importFilesBtn">📁 导入凭证文件</span></button>
+                <button onclick="syncFromOtherProjects()"><span id="importSyncOtherBtn">🔄 从其他项目同步</span></button>
                 <button onclick="showRefreshTokenDialog()"><span id="importTokenBtn">🔑 粘贴 Refresh Token</span></button>
                 <button onclick="startOAuthLogin()"><span id="importOAuthBtn">🌐 Google 登录</span></button>
               </div>
@@ -284,81 +280,82 @@
             <span id="emptyProvDesc">点击「添加供应商」配置第三方 API 供应商</span>
           </div>
         </div>
+      </div>
 
-        <!-- Add/Edit Provider Form (hidden by default) -->
-        <div id="providerFormOverlay" class="provider-form-overlay" style="display:none;">
-          <div class="provider-form-card">
-            <div class="provider-form-header">
-              <h2 id="providerFormTitle">添加 AI 供应商</h2>
-              <button class="form-close-btn" onclick="hideProviderForm()">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-              </button>
+      <!-- Add/Edit Provider Form (global overlay, works from any page) -->
+      <div id="providerFormOverlay" class="provider-form-overlay" style="display:none;">
+        <div class="provider-form-card">
+          <div class="provider-form-header">
+            <h2 id="providerFormTitle">添加 AI 供应商</h2>
+            <button class="form-close-btn" onclick="hideProviderForm()">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+          <div class="provider-form-body">
+            <input type="hidden" id="providerEditIndex" value="-1" />
+
+            <div class="form-group">
+              <label id="provFormNameLabel">供应商名称</label>
+              <input type="text" id="providerName" placeholder="例如：OpenAI 中转" class="setting-input" />
             </div>
-            <div class="provider-form-body">
-              <input type="hidden" id="providerEditIndex" value="-1" />
 
-              <div class="form-group">
-                <label id="provFormNameLabel">供应商名称</label>
-                <input type="text" id="providerName" placeholder="例如：OpenAI 中转" class="setting-input" />
+            <div class="form-group">
+              <label id="provFormProtoLabel">API 协议</label>
+              <div class="protocol-selector">
+                <button class="protocol-btn active" data-protocol="openai"
+                  onclick="selectProtocol('openai')">OpenAI</button>
+                <button class="protocol-btn" data-protocol="gemini" onclick="selectProtocol('gemini')">Gemini</button>
+                <button class="protocol-btn" data-protocol="claude" onclick="selectProtocol('claude')">Claude</button>
               </div>
+            </div>
 
-              <div class="form-group">
-                <label id="provFormProtoLabel">API 协议</label>
-                <div class="protocol-selector">
-                  <button class="protocol-btn active" data-protocol="openai"
-                    onclick="selectProtocol('openai')">OpenAI</button>
-                  <button class="protocol-btn" data-protocol="gemini" onclick="selectProtocol('gemini')">Gemini</button>
-                  <button class="protocol-btn" data-protocol="claude" onclick="selectProtocol('claude')">Claude</button>
-                </div>
-              </div>
+            <div class="form-group">
+              <label>Base URL</label>
+              <input type="text" id="providerBaseUrl" placeholder="https://api.openai.com/v1" class="setting-input" />
+              <span class="form-hint" id="provFormBaseUrlHint">API 端点的基础地址（不含 /chat/completions 等路径）</span>
+            </div>
 
-              <div class="form-group">
-                <label>Base URL</label>
-                <input type="text" id="providerBaseUrl" placeholder="https://api.openai.com/v1" class="setting-input" />
-                <span class="form-hint" id="provFormBaseUrlHint">API 端点的基础地址（不含 /chat/completions 等路径）</span>
-              </div>
-
-              <div class="form-group">
-                <label>API Key</label>
-                <div class="input-with-toggle">
-                  <input type="password" id="providerApiKey" placeholder="sk-..." class="setting-input" />
-                  <button class="toggle-visibility-btn" onclick="toggleApiKeyVisibility()" title="显示/隐藏"
-                    data-title-zh="显示/隐藏" data-title-en="Show/Hide">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                      <circle cx="12" cy="12" r="3" />
-                    </svg>
-                  </button>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label><span id="provFormMappingLabel">模型映射</span> <span class="form-hint-inline"
-                    id="provFormOptional">（可选）</span></label>
-                <div id="modelMappingList" class="model-mapping-list">
-                  <!-- Mapping entries are dynamically added here -->
-                </div>
-                <button class="action-btn-sm" onclick="addModelMappingRow()" style="margin-top: 8px;">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
+            <div class="form-group">
+              <label>API Key</label>
+              <div class="input-with-toggle">
+                <input type="password" id="providerApiKey" placeholder="sk-..." class="setting-input" />
+                <button class="toggle-visibility-btn" onclick="toggleApiKeyVisibility()" title="显示/隐藏"
+                  data-title-zh="显示/隐藏" data-title-en="Show/Hide">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
                   </svg>
-                  <span id="provFormAddMappingBtn">添加映射</span>
                 </button>
-                <span class="form-hint" id="provFormMappingHint">将反重力请求的模型名称映射到供应商实际的模型名称</span>
               </div>
+            </div>
 
+            <div class="form-group">
+              <label><span id="provFormMappingLabel">模型映射</span> <span class="form-hint-inline"
+                  id="provFormOptional">（可选）</span></label>
+              <div id="modelMappingList" class="model-mapping-list">
+                <!-- Mapping entries are dynamically added here -->
+              </div>
+              <button class="action-btn-sm" onclick="addModelMappingRow()" style="margin-top: 8px;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+                <span id="provFormAddMappingBtn">添加映射</span>
+              </button>
+              <span class="form-hint" id="provFormMappingHint">将反重力请求的模型名称映射到供应商实际的模型名称</span>
             </div>
-            <div class="provider-form-footer">
-              <button class="action-btn" onclick="hideProviderForm()"><span id="provFormCancelBtn">取消</span></button>
-              <button class="action-btn primary" onclick="saveProvider()"><span id="provFormSaveBtn">保存</span></button>
-            </div>
+
+          </div>
+          <div class="provider-form-footer">
+            <button class="action-btn" onclick="hideProviderForm()"><span id="provFormCancelBtn">取消</span></button>
+            <button class="action-btn primary" onclick="saveProvider()"><span id="provFormSaveBtn">保存</span></button>
           </div>
         </div>
       </div>
+
 
       <!-- Toolbox Page -->
       <div class="page" id="page-tools">
@@ -376,38 +373,33 @@
                   <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                 </svg>
               </div>
-              <h3 id="toolPatchTitle">IDE 补丁管理</h3>
+              <h3 id="toolPatchTitle">IDE 补丁</h3>
             </div>
-            <p class="tool-desc" id="toolPatchDesc">修改 Antigravity IDE 的核心文件，将 API 请求重定向到本地代理</p>
+            <p class="tool-desc" id="toolPatchDesc">将 IDE API 请求重定向到代理地址</p>
             <div class="tool-status" id="patchStatus">
               <span class="status-dot offline"></span>
               <span>未检测</span>
             </div>
             <div class="tool-actions">
-              <button class="action-btn success" onclick="applyPatch()">
+              <button class="action-btn" id="patchToggleBtn" onclick="togglePatch()">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="20 6 9 17 4 12" />
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                  <line x1="12" y1="2" x2="12" y2="12" />
                 </svg>
-                <span id="toolApplyPatchBtn">应用补丁</span>
-              </button>
-              <button class="action-btn danger" onclick="removePatch()">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="3 6 5 6 21 6" />
-                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                </svg>
-                <span id="toolRemovePatchBtn">撤销补丁</span>
+                <span id="patchToggleLabel">开启</span>
               </button>
               <button class="action-btn" onclick="openPatchTargetModal()">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M12 20h9" />
-                  <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                  <circle cx="12" cy="12" r="3" />
+                  <path
+                    d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
                 </svg>
-                <span id="toolEditPatchBtn">修改补丁</span>
+                <span>设置</span>
               </button>
             </div>
           </div>
 
-          <!-- Certificate Management -->
+          <!-- Certificate -->
           <div class="tool-card">
             <div class="tool-card-header">
               <div class="tool-icon" style="background: rgba(59,130,246,0.12);">
@@ -418,31 +410,226 @@
               </div>
               <h3 id="toolCertTitle">证书管理</h3>
             </div>
-            <p class="tool-desc" id="toolCertDesc">管理本地代理 HTTPS 自签证书，导入到系统受信任的根证书存储</p>
+            <p class="tool-desc" id="toolCertDesc">管理本地代理 HTTPS 自签证书</p>
             <div class="tool-status" id="certStatus">
               <span class="status-dot offline"></span>
               <span>未检测</span>
             </div>
             <div class="tool-actions">
-              <button class="action-btn info" onclick="importCert()">
+              <button class="action-btn" id="certToggleBtn" onclick="toggleCert()">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="7 10 12 15 17 10" />
-                  <line x1="12" y1="15" x2="12" y2="3" />
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                  <line x1="12" y1="2" x2="12" y2="12" />
                 </svg>
-                <span id="toolImportCertBtn">导入证书</span>
-              </button>
-              <button class="action-btn danger" onclick="removeCert()">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="12" cy="12" r="10" />
-                  <line x1="15" y1="9" x2="9" y2="15" />
-                  <line x1="9" y1="9" x2="15" y2="15" />
-                </svg>
-                <span id="toolRemoveCertBtn">卸载证书</span>
+                <span id="certToggleLabel">导入</span>
               </button>
             </div>
           </div>
 
+          <!-- Auto Accept -->
+          <div class="tool-card">
+            <div class="tool-card-header">
+              <div class="tool-icon" style="background: rgba(168,85,247,0.12);">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="2">
+                  <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z" />
+                  <path d="M9 12l2 2 4-4" />
+                </svg>
+              </div>
+              <h3 id="toolAutoAcceptTitle">自动审批</h3>
+            </div>
+            <p class="tool-desc" id="toolAutoAcceptDesc">自动点击 AI 面板中的审批按钮</p>
+            <div class="tool-status" id="autoAcceptStatus">
+              <span class="status-dot offline"></span>
+              <span id="autoAcceptStatusText">未检测</span>
+            </div>
+            <div class="tool-actions">
+              <button class="action-btn" id="autoAcceptToggleBtn" onclick="toggleAutoAcceptEnabled()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                  <line x1="12" y1="2" x2="12" y2="12" />
+                </svg>
+                <span id="autoAcceptToggleBtnText">开启</span>
+              </button>
+              <button class="action-btn" onclick="openAutoAcceptSettings()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="3" />
+                  <path
+                    d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
+                <span>设置</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- AI Providers -->
+          <div class="tool-card">
+            <div class="tool-card-header">
+              <div class="tool-icon" style="background: rgba(244,114,182,0.12);">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#f472b6" stroke-width="2">
+                  <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                  <path d="M2 17l10 5 10-5" />
+                  <path d="M2 12l10 5 10-5" />
+                </svg>
+              </div>
+              <h3 id="toolProvidersTitle">AI 供应商</h3>
+            </div>
+            <p class="tool-desc" id="toolProvidersDesc">配置第三方 API 中转供应商</p>
+            <div class="tool-status" id="providerStatus">
+              <span class="status-dot offline"></span>
+              <span id="providerStatusText">未启用</span>
+            </div>
+            <div class="tool-actions">
+              <button class="action-btn" id="providerToggleBtn" onclick="toggleProviderRouting()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                  <line x1="12" y1="2" x2="12" y2="12" />
+                </svg>
+                <span id="providerToggleLabel">开启</span>
+              </button>
+              <button class="action-btn" onclick="showProvidersModal()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="3" />
+                  <path
+                    d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
+                <span>管理</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Context Ring -->
+          <div class="tool-card">
+            <div class="tool-card-header">
+              <div class="tool-icon" style="background: rgba(20,184,166,0.12);">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#14b8a6" stroke-width="2">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 6v6l4 2" />
+                </svg>
+              </div>
+              <h3 id="toolContextRingTitle">上下文统计</h3>
+            </div>
+            <p class="tool-desc" id="toolContextRingDesc">在 IDE 聊天框旁显示上下文窗口用量指示器</p>
+            <div class="tool-status" id="contextRingStatus">
+              <span class="status-dot offline"></span>
+              <span id="contextRingStatusText">未检测</span>
+            </div>
+            <div class="tool-actions">
+              <button class="action-btn" id="contextRingToggleBtn" onclick="toggleContextRing()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                  <line x1="12" y1="2" x2="12" y2="12" />
+                </svg>
+                <span id="contextRingToggleLabel">开启</span>
+              </button>
+              <button class="action-btn" onclick="showContextRingSettings()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="3" />
+                  <path
+                    d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
+                <span>设置</span>
+              </button>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Context Ring Settings Modal -->
+        <div id="contextRingSettingsModal"
+          style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); z-index:10000; align-items:center; justify-content:center;">
+          <div
+            style="background:var(--bg-card, #18181b); border:1px solid var(--border, #27272a); border-radius:12px; width:400px; max-width:92vw; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden;">
+            <div
+              style="padding:16px 20px; border-bottom:1px solid var(--border, #27272a); display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">⚙️ 统计设置</span>
+              <button onclick="hideContextRingSettings()"
+                style="background:none; border:none; color:var(--text-secondary, #a1a1aa); font-size:20px; cursor:pointer; line-height:1;">✕</button>
+            </div>
+            <div style="padding:16px 20px;">
+              <div style="margin-bottom:16px;">
+                <div
+                  style="font-size:11px; color:var(--text-secondary, #a1a1aa); margin-bottom:6px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px;">
+                  滑动窗口 (秒)</div>
+                <p style="font-size:11px; color:var(--text-secondary, #71717a); margin:0 0 10px; line-height:1.5;">
+                  取最近 N 秒内的最大 token 值，过滤后台小请求造成的波动</p>
+                <div style="display:flex; align-items:center; gap:12px;">
+                  <input type="range" id="ringWindowSlider" min="5" max="120" value="15" step="5" style="flex:1;"
+                    oninput="document.getElementById('ringWindowValue').textContent = this.value + 's'" />
+                  <span id="ringWindowValue"
+                    style="font-size:14px; font-weight:600; min-width:36px; text-align:right; color:var(--text-primary, #fafafa);">15s</span>
+                </div>
+              </div>
+              <div
+                style="display:flex; gap:8px; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--border, #27272a);">
+                <button class="action-btn" onclick="hideContextRingSettings()">取消</button>
+                <button class="action-btn primary" onclick="saveContextRingSettings()">保存</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI Providers Modal -->
+        <div id="providersModal"
+          style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); z-index:10000; align-items:center; justify-content:center;">
+          <div
+            style="background:var(--bg-card, #18181b); border:1px solid var(--border, #27272a); border-radius:12px; width:520px; max-width:92vw; max-height:80vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden;">
+            <div
+              style="padding:16px 20px; border-bottom:1px solid var(--border, #27272a); display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">🔗 AI 供应商</span>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <button class="action-btn-sm primary" onclick="showAddProviderForm();">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                  <span>添加</span>
+                </button>
+                <button onclick="hideProvidersModal()"
+                  style="background:none; border:none; color:var(--text-secondary, #a1a1aa); font-size:20px; cursor:pointer; line-height:1;">✕</button>
+              </div>
+            </div>
+            <div id="providersModalBody" style="padding:16px 20px; overflow-y:auto; flex:1;">
+              <!-- Provider list rendered here dynamically -->
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Auto Accept Settings Modal -->
+      <div id="autoAcceptModal"
+        style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); z-index:10000; align-items:center; justify-content:center;">
+        <div
+          style="background:var(--bg-card, #18181b); border:1px solid var(--border, #27272a); border-radius:12px; width:440px; max-width:92vw; max-height:88vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden;">
+          <div
+            style="padding:16px 20px; border-bottom:1px solid var(--border, #27272a); display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);"> 自动审批设置</span>
+            <button onclick="closeAutoAcceptSettings()"
+              style="background:none; border:none; color:var(--text-secondary, #a1a1aa); font-size:20px; cursor:pointer; line-height:1;">✕</button>
+          </div>
+          <div style="padding:16px 20px; overflow-y:auto; flex:1;">
+            <div style="margin-bottom:18px;">
+              <div
+                style="font-size:11px; color:var(--text-secondary, #a1a1aa); margin-bottom:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px;">
+                审批按钮类型</div>
+              <div id="aaPatternGrid" style="display:grid; grid-template-columns:1fr 1fr; gap:7px;"></div>
+            </div>
+            <div>
+              <div
+                style="font-size:11px; color:var(--text-secondary, #a1a1aa); margin-bottom:7px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px;">
+                🛡️ 安全规则（每行一条，含关键词的命令不自动执行）</div>
+              <textarea id="aaBannedInput" rows="7"
+                style="width:100%; background:var(--bg-input, #111113); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-primary, #fafafa); font-size:12px; font-family:monospace; padding:8px; resize:vertical; box-sizing:border-box; line-height:1.6;"></textarea>
+              <button onclick="resetBannedCommands()"
+                style="margin-top:8px; padding:5px 12px; background:rgba(255,255,255,0.05); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-secondary, #a1a1aa); font-size:12px; cursor:pointer;">重置默认</button>
+            </div>
+          </div>
+          <div
+            style="padding:12px 20px; border-top:1px solid var(--border, #27272a); display:flex; gap:8px; justify-content:flex-end;">
+            <button onclick="closeAutoAcceptSettings()"
+              style="padding:8px 16px; background:rgba(255,255,255,0.06); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-secondary, #a1a1aa); font-size:13px; cursor:pointer;">取消</button>
+            <button onclick="saveAutoAcceptSettings()"
+              style="padding:8px 16px; background:linear-gradient(135deg,#3b82f6,#2563eb); border:none; border-radius:6px; color:#fff; font-size:13px; cursor:pointer; font-weight:600;">保存设置</button>
+          </div>
         </div>
       </div>
 
@@ -529,9 +716,10 @@
                 <span class="setting-label" id="settPortLabel">代理端口</span>
                 <span class="setting-desc" id="settPortDesc">本地代理监听端口，用于接收 IDE 请求并转发到上游</span>
               </div>
-              <div class="setting-control">
+              <div class="setting-control" style="display:flex; gap:8px; align-items:center;">
                 <input type="number" id="proxyPort" value="9527" min="1024" max="65535" class="setting-input"
                   style="width:100px;" onchange="onPortChange(this.value)">
+                <button class="action-btn-sm danger" onclick="killPortProcess()" title="强制结束占用该端口的进程">释放端口</button>
               </div>
             </div>
             <div class="setting-item">

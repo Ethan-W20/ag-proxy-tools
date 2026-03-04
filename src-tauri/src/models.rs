@@ -81,6 +81,14 @@ pub struct AppState {
     pub token_stats: crate::token_stats::TokenStatsManager,
     pub quota_threshold: Arc<Mutex<i32>>,
     pub quota_cache: Arc<Mutex<HashMap<String, QuotaData>>>,
+    /// Recent context usage entries for sliding-window max
+    pub last_context_usage: Arc<Mutex<Vec<(u64, String, i64)>>>,
+    /// The most recent entry (never expires) — fallback when window is empty
+    pub context_usage_latest: Arc<Mutex<(u64, String)>>,
+    /// Sliding window size in seconds (configurable by user, default 15)
+    pub context_ring_window_secs: Arc<Mutex<u64>>,
+    /// Auto-accept configuration (synced to injected IDE script via /auto-accept-config endpoint)
+    pub auto_accept_config: Arc<Mutex<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +114,12 @@ pub struct FlowHop {
 }
 
 /// Payload emitted via event `request-flow` to power the visual flow tracing panel.
+/// Emitted multiple times per request:
+///   - phase="received"   → request just arrived at proxy
+///   - phase="forwarding" → selecting account & forwarding to upstream
+///   - phase="streaming"  → upstream responded, streaming back
+///   - phase="completed"  → request fully finished
+///   - phase="error"      → request failed at some stage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestFlowPayload {
     pub id: String,
@@ -113,7 +127,9 @@ pub struct RequestFlowPayload {
     pub method: String,
     pub path: String,
     pub account: String,
-    pub mode: String,               // "direct" or "official_ls"
+    pub mode: String,               // "direct" / "official_ls" / "网关" / "proxy"
+    pub phase: String,              // "received" / "forwarding" / "streaming" / "completed" / "error"
+    pub target: Option<String>,     // upstream target URL or label
     /// Forward hops (request direction →)
     pub forward_hops: Vec<FlowHop>,
     /// Return hops (response direction ←)

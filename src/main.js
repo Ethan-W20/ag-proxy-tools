@@ -76,10 +76,12 @@ const UI_STATIC_TEXT = {
   dashErrorLabel: { zh: '错误请求', en: 'Errors' },
   dashInputLabel: { zh: '输入', en: 'Input' },
   dashOutputLabel: { zh: '输出', en: 'Output' },
+  dashCacheLabel: { zh: '缓存', en: 'Cache' },
   // Accounts page
   acctPageTitle: { zh: '账号管理', en: 'Account Management' },
   acctAddBtn: { zh: '添加账号', en: 'Add Account' },
   importFilesBtn: { zh: '📁 导入凭证文件', en: '📁 Import Credential Files' },
+  importSyncOtherBtn: { zh: '🔄 从其他项目同步', en: '🔄 Sync From Other Projects' },
   importTokenBtn: { zh: '🔑 粘贴 Refresh Token', en: '🔑 Paste Refresh Token' },
   importOAuthBtn: { zh: '🌐 Google 登录', en: '🌐 Google Login' },
   acctQueryQuotaBtn: { zh: '查询额度', en: 'Query Quotas' },
@@ -102,15 +104,10 @@ const UI_STATIC_TEXT = {
   // Tools page
   toolsPageTitle: { zh: '工具箱', en: 'Toolbox' },
   toolsPageDesc: { zh: 'IDE 补丁与证书管理', en: 'IDE patch and certificate management' },
-  toolPatchTitle: { zh: 'IDE 补丁管理', en: 'IDE Patch Management' },
-  toolApplyPatchBtn: { zh: '应用补丁', en: 'Apply Patch' },
-  toolRemovePatchBtn: { zh: '撤销补丁', en: 'Remove Patch' },
-  toolEditPatchBtn: { zh: '修改补丁', en: 'Edit Patch' },
+  toolPatchTitle: { zh: 'IDE 补丁', en: 'IDE Patch' },
   toolCertTitle: { zh: '证书管理', en: 'Certificate Management' },
-  toolImportCertBtn: { zh: '导入证书', en: 'Import Certificate' },
-  toolRemoveCertBtn: { zh: '卸载证书', en: 'Uninstall Certificate' },
-  toolPatchDesc: { zh: '修改 Antigravity IDE 的核心文件，将 API 请求重定向到本地代理', en: 'Modify IDE core files to redirect API requests to the local proxy' },
-  toolCertDesc: { zh: '管理本地代理 HTTPS 自签证书，导入到系统受信任的根证书存储', en: 'Manage local proxy HTTPS certificates and import to trusted root store' },
+  toolPatchDesc: { zh: '将 IDE API 请求重定向到代理地址', en: 'Redirect IDE API requests to the local proxy' },
+  toolCertDesc: { zh: '管理本地代理 HTTPS 自签证书', en: 'Manage local proxy HTTPS self-signed certificate' },
   // Patch target modal
   patchModalTitle: { zh: '修改补丁目标', en: 'Edit Patch Target' },
   patchModalUrlLabel: { zh: '补丁目标 URL', en: 'Patch Target URL' },
@@ -859,16 +856,30 @@ async function removePatch() {
   }
 }
 
+async function togglePatch() {
+  if (state.patchApplied) {
+    await removePatch();
+  } else {
+    await applyPatch();
+  }
+}
+
 async function checkPatchStatus() {
   try {
     const status = await invoke('check_patch_status');
     const el = document.getElementById('patchStatus');
+    const toggleBtn = document.getElementById('patchToggleBtn');
+    const toggleLabel = document.getElementById('patchToggleLabel');
     if (status.applied) {
-      el.innerHTML = `<span class="status-dot online"></span><span>${status.message || uiText('补丁已应用', 'Patch applied')}</span>`;
+      el.innerHTML = `<span class="status-dot online"></span><span>${status.message || uiText('已开启', 'Enabled')}</span>`;
       state.patchApplied = true;
+      if (toggleBtn) toggleBtn.className = 'action-btn danger';
+      if (toggleLabel) toggleLabel.textContent = uiText('关闭', 'Disable');
     } else {
-      el.innerHTML = `<span class="status-dot offline"></span><span>${status.message || uiText('未应用补丁', 'Patch not applied')}</span>`;
+      el.innerHTML = `<span class="status-dot offline"></span><span>${status.message || uiText('已关闭', 'Disabled')}</span>`;
       state.patchApplied = false;
+      if (toggleBtn) toggleBtn.className = 'action-btn success';
+      if (toggleLabel) toggleLabel.textContent = uiText('开启', 'Enable');
     }
   } catch (e) {
     console.error('Failed to check patch status:', e);
@@ -899,16 +910,30 @@ async function removeCert() {
   }
 }
 
+async function toggleCert() {
+  if (state.certInstalled) {
+    await removeCert();
+  } else {
+    await importCert();
+  }
+}
+
 async function checkCertStatus() {
   try {
     const status = await invoke('check_cert_status');
     const el = document.getElementById('certStatus');
+    const toggleBtn = document.getElementById('certToggleBtn');
+    const toggleLabel = document.getElementById('certToggleLabel');
     if (status.installed) {
       el.innerHTML = `<span class="status-dot online"></span><span>${uiText('证书已安装', 'Certificate installed')}</span>`;
       state.certInstalled = true;
+      if (toggleBtn) toggleBtn.className = 'action-btn danger';
+      if (toggleLabel) toggleLabel.textContent = uiText('卸载', 'Remove');
     } else {
       el.innerHTML = `<span class="status-dot offline"></span><span>${uiText('证书未安装', 'Certificate not installed')}</span>`;
       state.certInstalled = false;
+      if (toggleBtn) toggleBtn.className = 'action-btn success';
+      if (toggleLabel) toggleLabel.textContent = uiText('导入', 'Import');
     }
   } catch (e) {
     console.error('Failed to check cert status:', e);
@@ -1126,6 +1151,22 @@ async function importFromFiles() {
   }
 }
 
+async function syncFromOtherProjects() {
+  document.getElementById('importMenu')?.classList.remove('show');
+  try {
+    showToast(uiText('正在从其他项目同步账号...', 'Syncing accounts from other projects...'), 'info');
+    const count = await invoke('sync_accounts_from_legacy_projects');
+    await loadCredentials();
+    if (count > 0) {
+      showToast(uiText(`已同步 ${count} 个账号`, `Synced ${count} account(s)`), 'success');
+    } else {
+      showToast(uiText('未发现可同步的新账号', 'No new accounts to sync'), 'info');
+    }
+  } catch (e) {
+    showToast(uiText('同步失败: ', 'Sync failed: ') + e, 'error');
+  }
+}
+
 // Method 2: Paste Refresh Token
 function showRefreshTokenDialog() {
   document.getElementById('importMenu')?.classList.remove('show');
@@ -1174,12 +1215,40 @@ function formatQuotaErrorTitle(quotaError) {
   return `${uiText('额度异常', 'Quota error')}${codeText}: ${quotaError.message}`;
 }
 
+function hasSuccessfulQuotaSnapshot(quotaData) {
+  if (!quotaData || quotaData.is_forbidden) return false;
+  return Array.isArray(quotaData.models) && quotaData.models.length > 0;
+}
+
+function hasActiveQuotaError(account, quotaData) {
+  const quotaError = account?.quota_error;
+  if (!quotaError?.message) return false;
+
+  // If we already have a newer successful quota snapshot, treat old quota_error as stale.
+  if (hasSuccessfulQuotaSnapshot(quotaData)) {
+    const quotaTs = Number(quotaData?.last_updated || 0);
+    const errTs = Number(quotaError?.timestamp || 0);
+    if (quotaTs > 0 && errTs > 0 && quotaTs >= errTs) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function isAccountAbnormal(account) {
+  if (!account || !account.email) return false;
+  const quotaData = state.quotas?.[account.email];
+  if (quotaData?.is_forbidden) return true;
+  return hasActiveQuotaError(account, quotaData);
+}
+
 function buildAccountCardHtml(account, originalIdx) {
   const isActive = originalIdx === state.currentIdx;
   const quotaData = state.quotas[account.email];
   const isDisabled = !!account.disabled;
   const isForbidden = !!quotaData?.is_forbidden;
-  const hasQuotaError = !!account.quota_error?.message;
+  const hasQuotaError = hasActiveQuotaError(account, quotaData);
   const disabledTitle = account.disabled_reason
     ? uiText(`已禁用: ${account.disabled_reason}`, `Disabled: ${account.disabled_reason}`)
     : uiText('已禁用（refresh_token 可能失效）', 'Disabled (refresh_token may have expired)');
@@ -1437,12 +1506,21 @@ async function fetchAllQuotasUI() {
     const results = await invoke('fetch_all_quotas');
 
     // results [[email, QuotaData], ...]
+    const successEmails = new Set();
     for (const [email, quota] of results) {
       state.quotas[email] = quota;
+      successEmails.add(email);
     }
     saveQuotasCache();
-    await syncAccountStateFromBackend();
 
+    // Clear quota_error for accounts that refreshed successfully
+    for (const account of state.accounts) {
+      if (account && account.quota_error && successEmails.has(account.email)) {
+        account.quota_error = null;
+      }
+    }
+
+    await syncAccountStateFromBackend();
     renderAccounts();
     showToast(uiText(`额度查询完成: ${results.length} 个账号`, `Quota query complete: ${results.length} accounts`), 'success');
   } catch (e) {
@@ -1469,6 +1547,11 @@ async function fetchSingleQuota(idx) {
     if (email) {
       state.quotas[email] = quota;
       saveQuotasCache();
+    }
+    // Clear any previous quota_error on success
+    const account = state.accounts[idx];
+    if (account && account.quota_error) {
+      account.quota_error = null;
     }
     await syncAccountStateFromBackend();
     renderAccounts();
@@ -1620,18 +1703,7 @@ function applyTokenStatsToState(stats) {
 
 function getAbnormalAccountCount() {
   return state.accounts.reduce((count, account) => {
-    if (!account || !account.email) return count;
-    if (account.disabled) return count + 1;
-    // Only count auth errors (token revoked), ignore transient rate-limit/upstream errors
-    const qe = account.quota_error;
-    if (qe && qe.message) {
-      const kind = qe.kind || '';
-      const isAuthBroken = kind === 'auth_invalid_grant'
-        || kind === 'auth_verification_required'
-        || (qe.message.includes('Token') && qe.message.includes('Bad Request'));
-      if (isAuthBroken) return count + 1;
-    }
-    return count;
+    return count + (isAccountAbnormal(account) ? 1 : 0);
   }, 0);
 }
 
@@ -1749,6 +1821,19 @@ async function savePortConfig() {
   }
 }
 
+async function restorePortConfig() {
+  try {
+    const port = await invoke('load_port_config');
+    const el = document.getElementById('proxyPort');
+    if (el && port) {
+      el.value = port;
+    }
+    refreshPatchTargetDefaultText();
+  } catch (e) {
+    console.warn('Failed to restore port config:', e);
+  }
+}
+
 // ==================== AI Provider Management ====================
 
 function onPortChange(value) {
@@ -1760,6 +1845,16 @@ function onPortChange(value) {
 
   refreshPatchTargetDefaultText();
   savePortConfig();
+}
+
+async function killPortProcess() {
+  try {
+    const port = parseInt(document.getElementById('proxyPort').value, 10) || 9527;
+    const result = await invoke('kill_port_process', { port });
+    showToast(result, 'success');
+  } catch (e) {
+    showToast(uiText('释放端口失败: ', 'Failed to release port: ') + e, 'error');
+  }
 }
 
 function showAddProviderForm() {
@@ -1985,6 +2080,15 @@ function renderProviders() {
       </div>
     `;
   }).join('');
+
+  // Sync to providers modal if visible
+  const modalBody = document.getElementById('providersModalBody');
+  const modal = document.getElementById('providersModal');
+  if (modalBody && modal && modal.style.display === 'flex') {
+    modalBody.innerHTML = list.innerHTML;
+  }
+  // Update provider status indicator in toolbox
+  if (typeof updateProviderStatus === 'function') updateProviderStatus();
 }
 
 // Persist providers to localStorage and backend
@@ -2079,6 +2183,7 @@ function persistCurrentAccountSelection() {
 
 const FLOW_MAX_ENTRIES = 200;
 let flowEntries = [];
+const flowMap = new Map(); // flow.id -> index in flowEntries for O(1) lookup
 
 function getStatusClass(status) {
   if (!status) return 'sErr';
@@ -2171,9 +2276,9 @@ function renderFlowChain(hops, direction) {
       const arrowShowsX = arrowShowsDisconnected || !isSuccessStatus(arrowStatus);
       const statusText = arrowShowsX ? '×' : Number(arrowStatus);
       const statusCls = arrowShowsX ? 'sErr' : getStatusClass(Number(arrowStatus));
-      const arrowSvg = direction === 'forward'
-        ? '<svg width="40" height="12" viewBox="0 0 40 12"><line x1="0" y1="6" x2="34" y2="6" stroke="currentColor" stroke-width="1.5"/><polyline points="30,2 36,6 30,10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>'
-        : '<svg width="40" height="12" viewBox="0 0 40 12"><line x1="6" y1="6" x2="40" y2="6" stroke="currentColor" stroke-width="1.5"/><polyline points="10,2 4,6 10,10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+      const arrowSvg = direction === 'return'
+        ? '<svg width="40" height="12" viewBox="0 0 40 12"><line x1="6" y1="6" x2="40" y2="6" stroke="currentColor" stroke-width="1.5"/><polyline points="10,2 4,6 10,10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>'
+        : '<svg width="40" height="12" viewBox="0 0 40 12"><line x1="0" y1="6" x2="34" y2="6" stroke="currentColor" stroke-width="1.5"/><polyline points="30,2 36,6 30,10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
       const detailHopIndex = direction === 'forward' ? (i + 1) : i;
 
       html += `<div class="flow-arrow">
@@ -2187,15 +2292,18 @@ function renderFlowChain(hops, direction) {
 }
 
 function renderFlowEntry(flow) {
-  const isSuccess = flow.final_status && flow.final_status >= 200 && flow.final_status < 300;
-  const statusCls = getStatusClass(flow.final_status);
-  const entryClass = isSuccess ? 'is-success' : 'is-error';
+  const phase = flow.phase || 'completed';
+  const isFinished = phase === 'completed' || phase === 'error';
+  const isSuccess = isFinished && flow.final_status && flow.final_status >= 200 && flow.final_status < 300;
+  const statusCls = isFinished ? getStatusClass(flow.final_status) : '';
+  const phaseClass = isFinished ? (isSuccess ? 'is-success' : 'is-error') : ('is-phase-' + phase);
 
   // Shorten path for display
   const pathShort = flow.path.length > 60 ? flow.path.substring(0, 57) + '...' : flow.path;
 
   const entry = document.createElement('div');
-  entry.className = `flow-entry ${entryClass}`;
+  entry.className = `flow-entry ${phaseClass}`;
+  entry.id = 'flow-' + flow.id;
   entry.dataset.flowId = flow.id;
 
   entry.innerHTML = `
@@ -2204,8 +2312,10 @@ function renderFlowEntry(flow) {
       <span class="flow-entry-method">${escapeHtml(flow.method)}</span>
       <span class="flow-entry-path" title="${escapeHtml(flow.path)}">${escapeHtml(pathShort)}</span>
       <span class="flow-entry-account" title="${escapeHtml(flow.account)}">${escapeHtml(flow.account)}</span>
-      <span class="flow-entry-status ${statusCls} flow-status-chip" data-flow-dir="summary" title="点击查看该请求总结" onclick="openFlowDetailFromStatus(this, event)">${flow.final_status || 'ERR'}</span>
-      <span class="flow-entry-elapsed">${flow.elapsed_ms}ms</span>
+      <span class="flow-entry-mode">${flow.mode === 'official_ls' ? '\u{1f517}LS' : flow.mode === '\u7f51\u5173' ? '\u{1f310}\u7f51\u5173' : '\u{1f4e1}\u76f4\u8fde'}</span>
+
+      <span class="flow-entry-status ${statusCls} flow-status-chip ${isFinished ? '' : 'flow-status-pulsing'}" data-flow-dir="summary" title="点击查看该请求总结" onclick="openFlowDetailFromStatus(this, event)">${isFinished ? (flow.final_status || 'ERR') : ({ received: '\u23f3\u63a5\u6536', forwarding: '\u{1f504}\u8f6c\u53d1', streaming: '\u{1f4e1}\u6d41\u5f0f' }[phase] || phase)}</span>
+      <span class="flow-entry-elapsed">${isFinished ? flow.elapsed_ms + 'ms' : flow.elapsed_ms + 'ms\u2026'}</span>
       <svg class="flow-entry-toggle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polyline points="9 18 15 12 9 6" />
       </svg>
@@ -2220,7 +2330,7 @@ function renderFlowEntry(flow) {
       <div class="flow-chain-section">
         <div class="flow-chain-label">📥 响应方向 (←)</div>
         <div class="flow-chain">
-          ${renderFlowChain(flow.return_hops, 'return')}
+        ${renderFlowChain([...flow.return_hops].reverse(), 'return')}
         </div>
       </div>
       <div class="flow-entry-detail-label">链路详情（点击状态码切换）</div>
@@ -2253,10 +2363,14 @@ function resolveFlowDetailByChip(flow, chipEl) {
   if (flowDir === 'summary') {
     return flow.detail || '';
   }
-  const hopIndex = Number(chipEl.dataset.flowHopIndex);
+  let hopIndex = Number(chipEl.dataset.flowHopIndex);
   const hops = flowDir === 'return' ? flow.return_hops : flow.forward_hops;
   if (!Array.isArray(hops) || !Number.isInteger(hopIndex) || hopIndex < 0 || hopIndex >= hops.length) {
     return flow.detail || '';
+  }
+  // Return hops are rendered reversed, so map the index back to original array
+  if (flowDir === 'return') {
+    hopIndex = hops.length - 1 - hopIndex;
   }
   const hopDetail = hops[hopIndex]?.detail;
   if (typeof hopDetail === 'string' && hopDetail.trim()) {
@@ -2290,6 +2404,38 @@ function addFlowEntry(flow) {
   const emptyState = container.querySelector('.flow-empty-state');
   if (emptyState) emptyState.remove();
 
+  // Check if this flow ID already exists (real-time phase update)
+  if (flowMap.has(flow.id)) {
+    // Update data in array
+    const arrIdx = flowEntries.findIndex(f => f && f.id === flow.id);
+    if (arrIdx >= 0) flowEntries[arrIdx] = flow;
+
+    // Find and replace DOM element - try multiple methods
+    let oldEl = document.getElementById('flow-' + flow.id);
+    if (!oldEl) {
+      // Fallback: search by data attribute
+      oldEl = container.querySelector('[data-flow-id="' + flow.id + '"]');
+    }
+    if (!oldEl) {
+      // Last resort: iterate children
+      for (const child of container.children) {
+        if (child.dataset && child.dataset.flowId === flow.id) {
+          oldEl = child;
+          break;
+        }
+      }
+    }
+    if (oldEl) {
+      const wasExpanded = oldEl.classList.contains('expanded');
+      const newEl = renderFlowEntry(flow);
+      if (wasExpanded) newEl.classList.add('expanded');
+      oldEl.replaceWith(newEl);
+    }
+    return;
+  }
+
+  // New entry
+  flowMap.set(flow.id, true);
   flowEntries.unshift(flow);
   const entryEl = renderFlowEntry(flow);
 
@@ -2302,13 +2448,15 @@ function addFlowEntry(flow) {
 
   // Limit entries
   while (flowEntries.length > FLOW_MAX_ENTRIES) {
-    flowEntries.pop();
+    const removed = flowEntries.pop();
+    if (removed && removed.id) flowMap.delete(removed.id);
     if (container.lastChild) container.removeChild(container.lastChild);
   }
 }
 
 function clearFlowEntries() {
   flowEntries = [];
+  flowMap.clear();
   const container = document.getElementById('flowEntriesInner');
   if (container) {
     container.innerHTML = `
@@ -2335,6 +2483,12 @@ async function initFlowListener() {
           addFlowEntry(flow);
         }
       });
+      await listen('flow-usage', (event) => {
+        const usage = event.payload;
+        if (usage && usage.flow_id) {
+          updateFlowUsage(usage);
+        }
+      });
       console.log('Request flow listener registered');
     } catch (e) {
       console.error('Failed to register request-flow listener:', e);
@@ -2342,67 +2496,170 @@ async function initFlowListener() {
   }
 }
 
+function formatTokenK(n) {
+  if (n == null || n === 0) return '0';
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(1) + 'k';
+}
+
+function updateFlowUsage(usage) {
+  const flowId = usage.flow_id;
+  // Update stored flow entry data
+  const entry = flowEntries.find(f => f && f.id === flowId);
+  if (entry) {
+    entry.usage = usage;
+  }
+  // Update DOM
+  const entryEl = document.getElementById('flow-' + flowId);
+  if (!entryEl) return;
+  // Add/update usage badge in header
+  let usageBadge = entryEl.querySelector('.flow-usage-badge');
+  if (!usageBadge) {
+    const header = entryEl.querySelector('.flow-entry-header');
+    if (header) {
+      const toggle = header.querySelector('.flow-entry-toggle');
+      usageBadge = document.createElement('span');
+      usageBadge.className = 'flow-usage-badge';
+      if (toggle) {
+        header.insertBefore(usageBadge, toggle);
+      } else {
+        header.appendChild(usageBadge);
+      }
+    }
+  }
+  if (usageBadge) {
+    const inp = usage.input_tokens || 0;
+    const out = usage.output_tokens || 0;
+    const total = usage.total_tokens || 0;
+    usageBadge.innerHTML = `<span title="总计/Total">${formatTokenK(total)}</span>›<span title="输入/Input">${formatTokenK(inp)}</span>›<span title="输出/Output">${formatTokenK(out)}</span>`;
+    usageBadge.title = `Total: ${total.toLocaleString()} | Input: ${inp.toLocaleString()} | Output: ${out.toLocaleString()}`;
+  }
+}
+
 // ==================== Logging ====================
 
+function normalizeLogValue(value, fallback = '-') {
+  if (value === null || value === undefined || value === '') return fallback;
+  return String(value);
+}
+
+function formatLogYesNo(value) {
+  return value ? uiText('是', 'yes') : uiText('否', 'no');
+}
+
+function formatRequestCompareDetails(compare) {
+  const rewrite = compare?.rewrite || {};
+  const headers = compare?.headers || {};
+  const firstDiff = compare?.first_diff_at;
+  const firstDiffText = firstDiff === null || firstDiff === undefined
+    ? uiText('无', 'none')
+    : normalizeLogValue(firstDiff);
+
+  return [
+    uiText('请求对比', 'Request Compare'),
+    `${uiText('请求', 'Request')}: ${normalizeLogValue(compare?.method)} ${normalizeLogValue(compare?.path)}`,
+    `${uiText('目标', 'Target')}: ${normalizeLogValue(compare?.target)} (${normalizeLogValue(compare?.target_url)})`,
+    `${uiText('尝试', 'Attempt')}: ${normalizeLogValue(compare?.attempt)} / ${normalizeLogValue(compare?.attempt_total)}  ${uiText('模型', 'Model')}: ${normalizeLogValue(compare?.model)}`,
+    `${uiText('原始 Body', 'Original Body')}: ${normalizeLogValue(compare?.body_original_bytes, 0)} bytes, hash=${normalizeLogValue(compare?.body_original_hash)}`,
+    `${uiText('转发 Body', 'Forward Body')}: ${normalizeLogValue(compare?.body_forward_bytes, 0)} bytes, hash=${normalizeLogValue(compare?.body_forward_hash)}`,
+    `${uiText('Body 已改写', 'Body changed')}: ${formatLogYesNo(compare?.body_changed)} (${uiText('首个差异字节', 'First diff byte')}: ${firstDiffText})`,
+    '',
+    uiText('改写标记', 'Rewrite Flags'),
+    `- ${uiText('URL 项目修正', 'Project fix in URL')}: ${formatLogYesNo(rewrite?.project_in_path_rewritten)}`,
+    `- ${uiText('Body 项目修正', 'Project fix in body')}: ${formatLogYesNo(rewrite?.project_body_rewritten_base)}`,
+    `- ${uiText('name 占位符修正', 'Name placeholder fix')}: ${formatLogYesNo(rewrite?.project_name_placeholder_fixed)}`,
+    `- ${uiText('请求头透传', 'Header passthrough')}: ${formatLogYesNo(rewrite?.header_passthrough)}`,
+    `- ${uiText('保留原始UA', 'Preserve incoming UA')}: ${formatLogYesNo(rewrite?.preserve_incoming_user_agent)}`,
+    `- ${uiText('透传 IDE Authorization', 'Passthrough IDE Authorization')}: ${formatLogYesNo(rewrite?.stream_auth_passthrough)}`,
+    '',
+    uiText('关键头对比', 'Key Header Compare'),
+    `- incoming host: ${normalizeLogValue(headers?.incoming_host)}`,
+    `- upstream host: ${normalizeLogValue(headers?.upstream_host)}`,
+    `- incoming user-agent: ${normalizeLogValue(headers?.incoming_user_agent)}`,
+    `- upstream user-agent: ${normalizeLogValue(headers?.upstream_user_agent)}`,
+    `- incoming content-type: ${normalizeLogValue(headers?.incoming_content_type)}`,
+    `- upstream content-type: ${normalizeLogValue(headers?.upstream_content_type)}`,
+  ].join('\n');
+}
+
+function formatLogDetails(details) {
+  if (details === null || details === undefined) return '';
+  const raw = typeof details === 'string' ? details : String(details);
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.kind === 'request_compare') {
+      return formatRequestCompareDetails(parsed);
+    }
+    return JSON.stringify(parsed, null, 2);
+  } catch (e) {
+    return raw;
+  }
+}
+
 function addLog(msg, type = '', details = null) {
-  msg = translateBackendMsg(msg);
-  const logArea = document.getElementById('logArea');
-  const ts = new Date().toLocaleTimeString();
-  if (!logArea) {
+  try {
+    msg = translateBackendMsg(msg);
+    const logArea = document.getElementById('logArea');
+    const ts = new Date().toLocaleTimeString();
+    if (!logArea) {
+      if (details) {
+        console.log(`[${ts}] ${msg}`, details);
+      } else {
+        console.log(`[${ts}] ${msg}`);
+      }
+      return;
+    }
+    const line = document.createElement('div');
+    line.className = `log-line ${type} ${details ? 'has-details' : ''}`;
+
+    const header = document.createElement('div');
+    header.className = 'log-header';
+    header.textContent = `[${ts}] ${msg}`;
     if (details) {
-      console.log(`[${ts}] ${msg}`, details);
-    } else {
-      console.log(`[${ts}] ${msg}`);
+      header.innerHTML += ` <span class="details-toggle">${uiText('(点击查看详情)', '(click for details)')}</span>`;
+      line.onclick = () => {
+        const detailEl = line.querySelector('.log-details');
+        const isVisible = detailEl.style.display === 'block';
+        detailEl.style.display = isVisible ? 'none' : 'block';
+        line.classList.toggle('expanded', !isVisible);
+      };
     }
-    return;
-  }
-  const line = document.createElement('div');
-  line.className = `log-line ${type} ${details ? 'has-details' : ''}`;
+    line.appendChild(header);
 
-  const header = document.createElement('div');
-  header.className = 'log-header';
-  header.textContent = `[${ts}] ${msg}`;
-  if (details) {
-    header.innerHTML += ` <span class="details-toggle">${uiText('(点击查看详情)', '(click for details)')}</span>`;
-    line.onclick = () => {
-      const detailEl = line.querySelector('.log-details');
-      const isVisible = detailEl.style.display === 'block';
-      detailEl.style.display = isVisible ? 'none' : 'block';
-      line.classList.toggle('expanded', !isVisible);
-    };
-  }
-  line.appendChild(header);
-
-  if (details) {
-    const detailEl = document.createElement('pre');
-    detailEl.className = 'log-details';
-    try {
-      // Try to pretty-print JSON
-      const parsed = JSON.parse(details);
-      detailEl.textContent = JSON.stringify(parsed, null, 2);
-    } catch (e) {
-      detailEl.textContent = details;
+    if (details) {
+      const detailEl = document.createElement('pre');
+      detailEl.className = 'log-details';
+      detailEl.textContent = formatLogDetails(details);
+      detailEl.style.display = 'none';
+      line.appendChild(detailEl);
     }
-    detailEl.style.display = 'none';
-    line.appendChild(detailEl);
-  }
 
-  logArea.appendChild(line);
+    logArea.appendChild(line);
 
-  // If in error-only mode, hide non-error lines
-  if (currentLogMode === 'error' && type !== 'error' && type !== 'warning') {
-    line.style.display = 'none';
-  }
+    // If in error-only mode, hide non-error lines
+    if (currentLogMode === 'error' && type !== 'error' && type !== 'warning') {
+      line.style.display = 'none';
+    }
 
-  logArea.scrollTop = logArea.scrollHeight;
+    logArea.scrollTop = logArea.scrollHeight;
 
-  if (type === 'success' || type === 'error') {
-    queueDashboardMetricsRefresh(type === 'error' ? 120 : 600);
-  }
+    if (type === 'success' || type === 'error') {
+      queueDashboardMetricsRefresh(type === 'error' ? 120 : 600);
+    }
 
-  // Limit log line count
-  while (logArea.children.length > 500) {
-    logArea.removeChild(logArea.firstChild);
+    // Limit log line count
+    while (logArea.children.length > 500) {
+      logArea.removeChild(logArea.firstChild);
+    }
+  } catch (e) {
+    console.error('addLog render failed:', e, { msg, type, details });
+    const logArea = document.getElementById('logArea');
+    if (!logArea) return;
+    const ts = new Date().toLocaleTimeString();
+    const line = document.createElement('div');
+    line.className = 'log-line warning';
+    line.textContent = `[${ts}] LOG_RENDER_ERROR: ${String(msg)}`;
+    logArea.appendChild(line);
   }
 }
 
@@ -2488,6 +2745,9 @@ function updateDashboard() {
   }
   if (document.getElementById('dashOutputTokens')) {
     document.getElementById('dashOutputTokens').textContent = formatTokenMillions(state.tokenStats.total_output);
+  }
+  if (document.getElementById('dashCacheTokens')) {
+    document.getElementById('dashCacheTokens').textContent = formatTokenMillions(state.tokenStats.total_cache_read);
   }
 
 
@@ -2641,6 +2901,8 @@ async function mockInvoke(cmd, args) {
       return [];
     case 'toggle_account_disabled':
       return [];
+    case 'sync_accounts_from_legacy_projects':
+      return 0;
     case 'flush_token_stats':
       return 'ok';
     default:
@@ -2754,6 +3016,8 @@ function deferNonCriticalStartupChecks() {
   const runChecks = () => {
     checkPatchStatus();
     checkCertStatus();
+    checkAutoAcceptStatus();
+    checkContextRingStatus();
   };
 
   if (typeof window.requestIdleCallback === 'function') {
@@ -2810,6 +3074,7 @@ async function bootstrapApp() {
   await runStartupStep('Bind settings events', async () => {
     restoreSettings();
   });
+  await runStartupStep('Restore port config', restorePortConfig);
   await runStartupStep('Restore upstream server', restoreUpstreamServerConfig);
   await runStartupStep('Restore official LS', restoreOfficialLsEnabled);
   await runStartupStep('Restore HTTP protocol', restoreHttpProtocolMode);
@@ -2863,5 +3128,307 @@ function restoreSettings() {
     upstreamUrlEl.addEventListener('change', saveUpstreamCustomUrlConfig);
     upstreamUrlEl.addEventListener('blur', saveUpstreamCustomUrlConfig);
   }
+}
 
+// ==================== Auto Accept ====================
+
+const AA_STORAGE_KEY = 'ag-auto-accept-settings';
+const AA_PATTERNS = [
+  { id: 'retry', label: 'Retry', defaultEnabled: false },
+  { id: 'run', label: 'Run', defaultEnabled: true },
+  { id: 'apply', label: 'Apply', defaultEnabled: true },
+  { id: 'execute', label: 'Execute', defaultEnabled: true },
+  { id: 'confirm', label: 'Confirm', defaultEnabled: false },
+  { id: 'allow', label: 'Allow', defaultEnabled: true },
+  { id: 'accept', label: 'Accept', defaultEnabled: true },
+];
+const AA_DEFAULT_BANNED = [
+  'rm -rf /', 'rm -rf ~', 'rm -rf *', 'format c:', 'del /f /s /q',
+  'rmdir /s /q', ':(){:|:&};:', 'dd if=', 'mkfs.', '> /dev/sda', 'chmod -R 777 /'
+];
+
+function aaLoadSettings() {
+  try {
+    const raw = localStorage.getItem(AA_STORAGE_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      return {
+        enabled: p.enabled != null ? p.enabled : false,
+        patterns: Object.assign(
+          {},
+          AA_PATTERNS.reduce((a, c) => { a[c.id] = c.defaultEnabled; return a; }, {}),
+          p.patterns || {}
+        ),
+        bannedCommands: p.bannedCommands != null ? p.bannedCommands : [...AA_DEFAULT_BANNED],
+      };
+    }
+  } catch (e) { /* ignore */ }
+  return {
+    enabled: false,
+    patterns: AA_PATTERNS.reduce((a, c) => { a[c.id] = c.defaultEnabled; return a; }, {}),
+    bannedCommands: [...AA_DEFAULT_BANNED],
+  };
+}
+
+function aaSaveSettings(s) {
+  try { localStorage.setItem(AA_STORAGE_KEY, JSON.stringify(s)); } catch (e) { /* ignore */ }
+}
+
+function aaUpdateToggleBtn(enabled) {
+  const btn = document.getElementById('autoAcceptToggleBtn');
+  const txt = document.getElementById('autoAcceptToggleBtnText');
+  if (!btn) return;
+  if (enabled) {
+    btn.className = 'action-btn danger';
+    if (txt) txt.textContent = uiText('关闭', 'Disable');
+  } else {
+    btn.className = 'action-btn success';
+    if (txt) txt.textContent = uiText('开启', 'Enable');
+  }
+}
+
+async function toggleAutoAcceptEnabled() {
+  const s = aaLoadSettings();
+  const newEnabled = !s.enabled;
+
+  try {
+    if (newEnabled) {
+      // Inject script into IDE
+      const result = await invoke('apply_auto_accept');
+      s.enabled = true;
+      aaSaveSettings(s);
+      try { invoke('update_auto_accept_config', { configJson: JSON.stringify(s) }); } catch (e) { }
+      aaUpdateToggleBtn(true);
+      showToast(result || uiText('自动审批已开启', 'Auto approve enabled'), 'success');
+    } else {
+      // Remove script from IDE
+      const result = await invoke('remove_auto_accept');
+      s.enabled = false;
+      aaSaveSettings(s);
+      try { invoke('update_auto_accept_config', { configJson: JSON.stringify(s) }); } catch (e) { }
+      aaUpdateToggleBtn(false);
+      showToast(result || uiText('自动审批已关闭', 'Auto approve disabled'), 'info');
+    }
+    await checkAutoAcceptStatus();
+  } catch (e) {
+    showToast(uiText('操作失败: ', 'Operation failed: ') + e, 'error');
+  }
+}
+
+function openAutoAcceptSettings() {
+  const s = aaLoadSettings();
+  const grid = document.getElementById('aaPatternGrid');
+  if (grid) {
+    grid.innerHTML = '';
+    AA_PATTERNS.forEach(p => {
+      const lbl = document.createElement('label');
+      const isOn = s.patterns[p.id] != null ? s.patterns[p.id] : p.defaultEnabled;
+      lbl.style.cssText =
+        'display:flex; align-items:center; gap:8px; padding:8px 10px;' +
+        'background:rgba(255,255,255,0.04); border:1px solid ' + (isOn ? '#3b82f6' : '#27272a') + ';' +
+        'border-radius:6px; cursor:pointer; font-size:13px; color:var(--text-primary, #fafafa); transition:border-color 0.2s;';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = isOn;
+      cb.dataset.patternId = p.id;
+      cb.style.accentColor = '#3b82f6';
+      cb.addEventListener('change', () => {
+        lbl.style.borderColor = cb.checked ? '#3b82f6' : '#27272a';
+      });
+      const span = document.createElement('span');
+      span.textContent = p.label;
+      lbl.appendChild(cb);
+      lbl.appendChild(span);
+      grid.appendChild(lbl);
+    });
+  }
+  const ta = document.getElementById('aaBannedInput');
+  if (ta) ta.value = (s.bannedCommands || []).join('\n');
+  const modal = document.getElementById('autoAcceptModal');
+  if (modal) modal.style.display = 'flex';
+}
+
+function closeAutoAcceptSettings() {
+  const modal = document.getElementById('autoAcceptModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function saveAutoAcceptSettings() {
+  const s = aaLoadSettings();
+  document.querySelectorAll('#aaPatternGrid input[data-pattern-id]').forEach(cb => {
+    s.patterns[cb.dataset.patternId] = cb.checked;
+  });
+  const ta = document.getElementById('aaBannedInput');
+  if (ta) s.bannedCommands = ta.value.split('\n').map(l => l.trim()).filter(l => l);
+  aaSaveSettings(s);
+  // Push config to backend so the injected IDE script picks it up
+  try {
+    invoke('update_auto_accept_config', { configJson: JSON.stringify(s) });
+  } catch (e) { console.error('Failed to push auto-accept config:', e); }
+  closeAutoAcceptSettings();
+  showToast(uiText('设置已保存', 'Settings saved'), 'success');
+}
+
+function resetBannedCommands() {
+  const ta = document.getElementById('aaBannedInput');
+  if (ta) ta.value = AA_DEFAULT_BANNED.join('\n');
+}
+
+async function checkAutoAcceptStatus() {
+  try {
+    const status = await invoke('check_auto_accept_status');
+    const statusEl = document.getElementById('autoAcceptStatus');
+    if (!statusEl) return;
+    if (status.applied) {
+      statusEl.innerHTML = `<span class="status-dot online"></span><span id="autoAcceptStatusText">${uiText('自动审批 已开启', 'Auto Approve Enabled')}</span>`;
+    } else {
+      statusEl.innerHTML = `<span class="status-dot offline"></span><span id="autoAcceptStatusText">${uiText('自动审批 已关闭', 'Auto Approve Disabled')}</span>`;
+    }
+    // Sync button state with actual injection status
+    const s = aaLoadSettings();
+    if (s.enabled !== status.applied) {
+      s.enabled = status.applied;
+      aaSaveSettings(s);
+    }
+    aaUpdateToggleBtn(status.applied);
+  } catch (e) {
+    console.error('Failed to check auto accept status:', e);
+  }
+}
+
+async function applyAutoAccept() {
+  try {
+    showToast(uiText('正在开启...', 'Enabling...'), 'info');
+    const result = await invoke('apply_auto_accept');
+    showToast(result || uiText('已开启', 'Enabled'), 'success');
+    await checkAutoAcceptStatus();
+  } catch (e) {
+    showToast(uiText('开启失败: ', 'Enable failed: ') + e, 'error');
+  }
+}
+
+async function removeAutoAccept() {
+  try {
+    showToast(uiText('正在关闭...', 'Disabling...'), 'info');
+    const result = await invoke('remove_auto_accept');
+    showToast(result || uiText('已关闭', 'Disabled'), 'success');
+    await checkAutoAcceptStatus();
+  } catch (e) {
+    showToast(uiText('关闭失败: ', 'Disable failed: ') + e, 'error');
+  }
+}
+
+// ==================== Context Ring Indicator ====================
+
+async function checkContextRingStatus() {
+  try {
+    const status = await invoke('check_context_ring_status');
+    const statusEl = document.getElementById('contextRingStatus');
+    const toggleBtn = document.getElementById('contextRingToggleBtn');
+    const toggleLabel = document.getElementById('contextRingToggleLabel');
+    if (!statusEl) return;
+    if (status.applied) {
+      statusEl.innerHTML = `<span class="status-dot online"></span><span id="contextRingStatusText">${uiText('上下文统计 已开启', 'Context Stats Enabled')}</span>`;
+      if (toggleBtn) toggleBtn.className = 'action-btn danger';
+      if (toggleLabel) toggleLabel.textContent = uiText('关闭', 'Disable');
+    } else {
+      statusEl.innerHTML = `<span class="status-dot offline"></span><span id="contextRingStatusText">${status.message || uiText('上下文统计 已关闭', 'Context Stats Disabled')}</span>`;
+      if (toggleBtn) toggleBtn.className = 'action-btn success';
+      if (toggleLabel) toggleLabel.textContent = uiText('开启', 'Enable');
+    }
+  } catch (e) {
+    console.error('Failed to check context ring status:', e);
+  }
+}
+
+async function toggleContextRing() {
+  try {
+    showToast(uiText('处理中...', 'Processing...'), 'info');
+    const result = await invoke('toggle_context_ring');
+    showToast(result, 'success');
+    await checkContextRingStatus();
+  } catch (e) {
+    showToast(uiText('操作失败: ', 'Failed: ') + e, 'error');
+  }
+}
+
+async function showContextRingSettings() {
+  const modal = document.getElementById('contextRingSettingsModal');
+  if (!modal) return;
+  try {
+    const secs = await invoke('get_context_ring_window');
+    document.getElementById('ringWindowSlider').value = secs;
+    document.getElementById('ringWindowValue').textContent = secs + 's';
+  } catch (e) { }
+  modal.style.display = 'flex';
+}
+
+function hideContextRingSettings() {
+  const modal = document.getElementById('contextRingSettingsModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function saveContextRingSettings() {
+  const slider = document.getElementById('ringWindowSlider');
+  const secs = parseInt(slider.value, 10) || 15;
+  try {
+    const result = await invoke('set_context_ring_window', { seconds: secs });
+    showToast(result, 'success');
+    hideContextRingSettings();
+  } catch (e) {
+    showToast(uiText('保存失败: ', 'Save failed: ') + e, 'error');
+  }
+}
+
+// ==================== Providers Modal ====================
+
+function showProvidersModal() {
+  const modal = document.getElementById('providersModal');
+  if (!modal) return;
+  // Sync content from the providers page list to the modal body
+  const srcList = document.getElementById('providerList');
+  const modalBody = document.getElementById('providersModalBody');
+  if (srcList && modalBody) {
+    modalBody.innerHTML = srcList.innerHTML;
+  }
+  modal.style.display = 'flex';
+}
+
+function hideProvidersModal() {
+  const modal = document.getElementById('providersModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function toggleProviderRouting() {
+  const hasEnabled = state.providers.some(p => p.enabled);
+  if (hasEnabled) {
+    // Disable all
+    state.providers.forEach(p => p.enabled = false);
+    showToast(uiText('已关闭所有供应商中转', 'All provider routing disabled'), 'info');
+  } else {
+    // Enable all
+    state.providers.forEach(p => p.enabled = true);
+    showToast(uiText('已开启所有供应商中转', 'All provider routing enabled'), 'success');
+  }
+  renderProviders();
+  persistProviders();
+  updateProviderStatus();
+}
+
+function updateProviderStatus() {
+  const statusEl = document.getElementById('providerStatus');
+  const toggleBtn = document.getElementById('providerToggleBtn');
+  const toggleLabel = document.getElementById('providerToggleLabel');
+  if (!statusEl) return;
+  const enabledCount = state.providers.filter(p => p.enabled).length;
+  const totalCount = state.providers.length;
+  if (enabledCount > 0) {
+    statusEl.innerHTML = `<span class="status-dot online"></span><span id="providerStatusText">${uiText(`${enabledCount}/${totalCount} 个供应商已启用`, `${enabledCount}/${totalCount} providers enabled`)}</span>`;
+    if (toggleBtn) toggleBtn.className = 'action-btn danger';
+    if (toggleLabel) toggleLabel.textContent = uiText('关闭', 'Disable');
+  } else {
+    statusEl.innerHTML = `<span class="status-dot offline"></span><span id="providerStatusText">${totalCount > 0 ? uiText('中转已关闭', 'Routing disabled') : uiText('未配置供应商', 'No providers')}</span>`;
+    if (toggleBtn) toggleBtn.className = 'action-btn success';
+    if (toggleLabel) toggleLabel.textContent = uiText('开启', 'Enable');
+  }
 }
