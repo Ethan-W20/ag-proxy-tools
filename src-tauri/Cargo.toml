@@ -1,6 +1,6 @@
 [package]
 name = "ag-proxy-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "A desktop proxy manager for AI coding assistants, built with Tauri v2"
 authors = []
 edition = "2021"
