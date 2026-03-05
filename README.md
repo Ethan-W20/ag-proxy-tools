@@ -16,7 +16,7 @@
 
 ---
 
-**AG Proxy Manager** 专为 Antigravity IDE 工具集合。主要功能是允许用户在一个IDE实例中使用多个账号的额度，目前还有重定向Antigravity请求地址、自动审批、上下文窗口统计、ai供应商等工具，未来会开发更多工具，让用户拥有更好的Antigravity体验
+**AG Proxy Manager** 专为 Antigravity IDE 工具集合。主要功能是允许用户在一个IDE实例中使用多个账号的额度，并可无视403身份验证直接调用账号额度，目前还有重定向Antigravity请求地址、自动审批、上下文窗口统计、ai供应商等工具，未来会开发更多工具，让用户拥有更好的Antigravity体验
 ---
 
 ## ✨ 功能特性
