@@ -268,6 +268,7 @@ fn get_auto_accept_script() -> String {
     next();
   }
   var timer; new MutationObserver(function(){ clearTimeout(timer); timer=setTimeout(scan,600); }).observe(document.documentElement,{childList:true,subtree:true});
+  setInterval(scan, 3000);
   setTimeout(scan,2000);
   console.log('[AG-AutoAccept] ready (config from proxy)');
 })();

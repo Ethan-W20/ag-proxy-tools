@@ -23,7 +23,7 @@ use crate::models::{Account, AiProvider, AppState, QuotaData, QuotaErrorInfo};
 use crate::provider::{
     extract_model_from_body, extract_model_from_path, find_provider_for_model, forward_to_provider,
 };
-use crate::utils::{emit_log, emit_request_flow, full_body, get_app_data_dir, BoxBody};
+use crate::utils::{emit_log, full_body, get_app_data_dir, BoxBody};
 pub(crate) use crate::proxy_error::{
     classify_error_kind_from_message, classify_error_kind_from_status,
     should_disable_account_for_error_kind,
@@ -297,26 +297,13 @@ struct ForwardTarget {
     target_url: String,
 }
 
-/// Resolve forward targets.
-///
-/// When official LS is enabled and running, the first target is the LS local port.
-/// Always falls back to direct upstream targets.
+/// Resolve forward targets (direct upstream only).
 async fn resolve_forward_targets(
     path_query: &str,
-    official_ls_enabled: bool,
     upstream_server: &str,
     upstream_custom_url: &str,
 ) -> Result<Vec<ForwardTarget>, String> {
     let mut targets = Vec::new();
-
-    if official_ls_enabled {
-        if let Some(base_url) = crate::ls_bridge::get_official_ls_https_base_url().await {
-            targets.push(ForwardTarget {
-                label: "official_ls".to_string(),
-                target_url: format!("{}{}", base_url, path_query),
-            });
-        }
-    }
 
     // Always add direct upstream as fallback
     targets.extend(build_legacy_forward_targets(
@@ -1160,552 +1147,10 @@ fn build_upstream_request(
     req_builder.body(body_bytes.clone())
 }
 
-fn verbose_header_logging_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("AG_PROXY_VERBOSE_HEADER_LOG")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
 
-fn mask_header_value(name: &str, value: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    if lower == "authorization" {
-        if let Some((scheme, _)) = value.split_once(' ') {
-            return format!("{} ***", scheme);
-        }
-        return "***".to_string();
-    }
-    if lower.contains("cookie")
-        || lower.contains("token")
-        || lower.contains("api-key")
-        || lower.contains("apikey")
-    {
-        return "***".to_string();
-    }
-    value.to_string()
-}
+use crate::proxy_log::{emit_upstream_perf_log, FlowDetailBundle, emit_request_summary_log, INTERNAL_UPSTREAM_PROTOCOL_HEADER, resolve_observed_upstream_protocol, rewrite_request_preview_protocol, format_upstream_request_preview, format_flow_body_bytes, estimate_flow_body_tokens, build_request_compare_details, build_flow_diag_block, format_incoming_headers_for_log, verbose_header_logging_enabled};
+use crate::proxy_usage::{UsageRecorder, record_non_sse_usage};
 
-fn format_incoming_headers_for_log(headers: &HeaderMap) -> String {
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let key = name.as_str();
-            let raw = value.to_str().unwrap_or("<binary>");
-            format!("{}: {}", key, mask_header_value(key, raw))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-// NOTE: format_incoming_headers_for_flow removed — identical to format_incoming_headers_for_log
-
-fn format_upstream_headers(headers: &reqwest::header::HeaderMap) -> String {
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let key = name.as_str();
-            let raw = value.to_str().unwrap_or("<binary>");
-            format!("{}: {}", key, mask_header_value(key, raw))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-// NOTE: format_upstream_headers_for_flow removed — identical to format_upstream_headers
-
-fn emit_upstream_perf_log(
-    app: &tauri::AppHandle,
-    method: &http::Method,
-    path_query: &str,
-    target: &str,
-    mode: &str,
-    status: Option<u16>,
-    elapsed_ms: u128,
-) {
-    // Only emit perf log for non-2xx or errors to reduce noise
-    let is_success = status.map(|s| (200..300).contains(&(s as i32))).unwrap_or(false);
-    if is_success {
-        return;
-    }
-    let status_text = status
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "ERR".to_string());
-    emit_log(
-        app,
-        &format!(
-            "Upstream perf [{} {}] mode={} target={} status={} elapsed={}ms",
-            method, path_query, mode, target, status_text, elapsed_ms
-        ),
-        "warning",
-        None,
-    );
-}
-
-#[derive(Default, Clone)]
-struct FlowDetailBundle {
-    summary: Option<String>,
-    client_to_local: Option<String>,
-    local_to_upstream: Option<String>,
-    upstream_to_local: Option<String>,
-    local_to_client: Option<String>,
-}
-
-fn emit_request_summary_log(
-    app: &tauri::AppHandle,
-    method: &http::Method,
-    path_query: &str,
-    mode: &str,
-    account: &str,
-    target: &str,
-    status: u16,
-    elapsed_ms: u128,
-    flow_details: FlowDetailBundle,
-    flow_id: &str,
-    flow_timestamp: &str,
-) {
-    let log_type = if (200..300).contains(&(status as i32)) { "dim" } else { "warning" };
-    emit_log(
-        app,
-        &format!(
-            "Request summary [{} {}] mode={} account=[{}] target={} status={} elapsed={}ms",
-            method, path_query, mode, account, target, status, elapsed_ms
-        ),
-        log_type,
-        None,
-    );
-
-    // Also emit structured request-flow event for the visual tracing panel
-    use crate::models::{FlowHop, RequestFlowPayload};
-    let is_success = (200..300).contains(&(status as i32));
-    let is_gateway = mode == "client_gateway" || mode == "gateway";
-    let is_ls = mode == "official_ls";
-
-    let fwd_status = Some(status);
-    let ret_status = Some(status);
-    let d_client_to_local = flow_details.client_to_local.clone();
-    let d_local_to_upstream = flow_details.local_to_upstream.clone();
-    let d_upstream_to_local = flow_details.upstream_to_local.clone();
-    let d_local_to_client = flow_details.local_to_client.clone();
-
-    let (forward_hops, return_hops) = if is_gateway || is_ls {
-        (
-            vec![
-                FlowHop {
-                    node: "IDE".into(),
-                    status: Some(200),
-                    detail: None,
-                },
-                FlowHop {
-                    node: "本地代理".into(),
-                    status: Some(200),
-                    detail: d_client_to_local.clone(),
-                },
-                FlowHop {
-                    node: if is_ls { "官方LS".into() } else { "网关".into() },
-                    status: Some(200),
-                    detail: d_local_to_upstream.clone(),
-                },
-                FlowHop {
-                    node: "上游".into(),
-                    status: fwd_status,
-                    detail: d_local_to_upstream
-                        .clone()
-                        .or_else(|| Some(format!("target={}", target))),
-                },
-            ],
-            vec![
-                FlowHop {
-                    node: "上游".into(),
-                    status: ret_status,
-                    detail: d_upstream_to_local.clone(),
-                },
-                FlowHop {
-                    node: if is_ls { "官方LS".into() } else { "网关".into() },
-                    status: ret_status,
-                    detail: d_upstream_to_local.clone(),
-                },
-                FlowHop {
-                    node: "本地代理".into(),
-                    status: ret_status,
-                    detail: d_local_to_client
-                        .clone()
-                        .or_else(|| d_upstream_to_local.clone()),
-                },
-                FlowHop {
-                    node: "IDE".into(),
-                    status: ret_status,
-                    detail: d_local_to_client.clone(),
-                },
-            ],
-        )
-    } else {
-        (
-            vec![
-                FlowHop {
-                    node: "IDE".into(),
-                    status: Some(200),
-                    detail: None,
-                },
-                FlowHop {
-                    node: "本地代理".into(),
-                    status: Some(200),
-                    detail: d_client_to_local,
-                },
-                FlowHop {
-                    node: "上游".into(),
-                    status: fwd_status,
-                    detail: d_local_to_upstream.or_else(|| Some(format!("target={}", target))),
-                },
-            ],
-            vec![
-                FlowHop {
-                    node: "上游".into(),
-                    status: ret_status,
-                    detail: d_upstream_to_local.clone(),
-                },
-                FlowHop {
-                    node: "本地代理".into(),
-                    status: ret_status,
-                    detail: d_local_to_client
-                        .clone()
-                        .or_else(|| d_upstream_to_local.clone()),
-                },
-                FlowHop {
-                    node: "IDE".into(),
-                    status: ret_status,
-                    detail: d_local_to_client,
-                },
-            ],
-        )
-    };
-
-    let phase = if is_success { "completed" } else { "error" };
-
-    let flow = RequestFlowPayload {
-        id: flow_id.to_string(),
-        timestamp: flow_timestamp.to_string(),
-        method: method.to_string(),
-        path: path_query.to_string(),
-        account: account.to_string(),
-        mode: if is_gateway { "网关".into() } else if is_ls { "official_ls".into() } else { "direct".into() },
-        phase: phase.to_string(),
-        target: Some(target.to_string()),
-        forward_hops,
-        return_hops,
-        final_status: Some(status),
-        elapsed_ms,
-        detail: flow_details.summary.or_else(|| {
-            if is_success {
-                None
-            } else {
-                Some(format!("target={} status={}", target, status))
-            }
-        }),
-    };
-    emit_request_flow(app, &flow);
-}
-
-fn format_http_version(version: http::Version) -> &'static str {
-    match version {
-        http::Version::HTTP_09 => "HTTP/0.9",
-        http::Version::HTTP_10 => "HTTP/1.0",
-        http::Version::HTTP_11 => "HTTP/1.1",
-        http::Version::HTTP_2 => "HTTP/2",
-        _ => "HTTP/?",
-    }
-}
-
-const INTERNAL_UPSTREAM_PROTOCOL_HEADER: &str = "x-ag-upstream-protocol";
-
-fn normalize_http_version_text(value: &str) -> Option<&'static str> {
-    match value.trim().to_ascii_uppercase().as_str() {
-        "HTTP/0.9" => Some("HTTP/0.9"),
-        "HTTP/1.0" => Some("HTTP/1.0"),
-        "HTTP/1.1" => Some("HTTP/1.1"),
-        "HTTP/2" | "HTTP/2.0" => Some("HTTP/2"),
-        _ => None,
-    }
-}
-
-fn resolve_observed_upstream_protocol(resp: &reqwest::Response, transport_mode: &str) -> String {
-    if transport_mode == "official_ls" {
-        if let Some(v) = resp
-            .headers()
-            .get(INTERNAL_UPSTREAM_PROTOCOL_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .and_then(normalize_http_version_text)
-        {
-            return v.to_string();
-        }
-    }
-    format_http_version(resp.version()).to_string()
-}
-
-fn rewrite_request_preview_protocol(preview: &str, protocol: &str) -> String {
-    let mut parts = preview.splitn(4, ' ');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(method), Some(path), Some(version), Some(rest)) if version.starts_with("HTTP/") => {
-            format!("{} {} {} {}", method, path, protocol, rest)
-        }
-        _ => preview.to_string(),
-    }
-}
-
-fn format_upstream_request_preview(
-    req: &reqwest::Request,
-    fallback_host: &str,
-    body_len: usize,
-) -> String {
-    let url = req.url();
-    let path = url.path();
-    let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    let path_query = format!("{}{}", path, query);
-
-    let host = if let Some(h) = url.host_str() {
-        if let Some(port) = url.port() {
-            format!("{}:{}", h, port)
-        } else {
-            h.to_string()
-        }
-    } else {
-        fallback_host.to_string()
-    };
-    let version = format_http_version(req.version());
-
-    let headers = format_upstream_headers(req.headers());
-    if headers.is_empty() {
-        format!(
-            "{} {} {} host: {} content-length: {}",
-            req.method(),
-            path_query,
-            version,
-            host,
-            body_len
-        )
-    } else {
-        format!(
-            "{} {} {} host: {} content-length: {} {}",
-            req.method(),
-            path_query,
-            version,
-            host,
-            body_len,
-            headers
-        )
-    }
-}
-
-// NOTE: format_upstream_request_preview_for_flow removed — identical to format_upstream_request_preview
-
-
-fn format_flow_body_bytes(body: &[u8]) -> String {
-    if body.is_empty() {
-        return "<empty>".to_string();
-    }
-
-    match std::str::from_utf8(body) {
-        Ok(text) => text.to_string(),
-        Err(_) => format!("<binary body omitted: {} bytes>", body.len()),
-    }
-}
-
-fn estimate_flow_body_tokens(body: &[u8]) -> usize {
-    if body.is_empty() {
-        return 0;
-    }
-
-    match std::str::from_utf8(body) {
-        Ok(text) => {
-            let mut ascii_non_ws = 0usize;
-            let mut non_ascii_non_ws = 0usize;
-            for ch in text.chars() {
-                if ch.is_whitespace() {
-                    continue;
-                }
-                if ch.is_ascii() {
-                    ascii_non_ws += 1;
-                } else {
-                    non_ascii_non_ws += 1;
-                }
-            }
-            let ascii_tokens = ascii_non_ws.div_ceil(4);
-            let estimated = ascii_tokens.saturating_add(non_ascii_non_ws);
-            estimated.max(1)
-        }
-        Err(_) => body.len().div_ceil(4).max(1),
-    }
-}
-
-fn header_value_or_dash(headers: &HeaderMap, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn req_header_value_or_dash(headers: &reqwest::header::HeaderMap, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn short_body_hash_hex(body: &[u8]) -> String {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
-    let mut hash = OFFSET_BASIS;
-    for b in body {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{:016x}", hash)
-}
-
-fn first_body_diff_offset(original: &[u8], forwarded: &[u8]) -> Option<usize> {
-    let limit = original.len().min(forwarded.len());
-    for i in 0..limit {
-        if original[i] != forwarded[i] {
-            return Some(i);
-        }
-    }
-    if original.len() != forwarded.len() {
-        Some(limit)
-    } else {
-        None
-    }
-}
-
-fn build_request_compare_details(
-    method: &http::Method,
-    path_query: &str,
-    target_label: &str,
-    original_target_url: &str,
-    patched_target_url: &str,
-    attempt_idx: usize,
-    attempt_total: usize,
-    attempt_model: &str,
-    incoming_headers: &HeaderMap,
-    built_req: &reqwest::Request,
-    original_body: &[u8],
-    forwarded_body: &[u8],
-    header_passthrough: bool,
-    preserve_incoming_user_agent: bool,
-    stream_auth_passthrough: bool,
-    project_name_placeholder_fixed: bool,
-    base_project_body_rewritten: bool,
-) -> String {
-    let upstream_path_query = built_req
-        .url()
-        .query()
-        .map(|q| format!("{}?{}", built_req.url().path(), q))
-        .unwrap_or_else(|| built_req.url().path().to_string());
-
-    let compare_json = serde_json::json!({
-        "kind": "request_compare",
-        "method": method.to_string(),
-        "path": path_query,
-        "target": target_label,
-        "target_url": patched_target_url,
-        "upstream_path": upstream_path_query,
-        "attempt": attempt_idx + 1,
-        "attempt_total": attempt_total,
-        "model": attempt_model,
-        "body_original_bytes": original_body.len(),
-        "body_forward_bytes": forwarded_body.len(),
-        "body_original_hash": short_body_hash_hex(original_body),
-        "body_forward_hash": short_body_hash_hex(forwarded_body),
-        "body_changed": original_body != forwarded_body,
-        "first_diff_at": first_body_diff_offset(original_body, forwarded_body),
-        "rewrite": {
-            "project_in_path_rewritten": patched_target_url != original_target_url,
-            "project_body_rewritten_base": base_project_body_rewritten,
-            "project_name_placeholder_fixed": project_name_placeholder_fixed,
-            "header_passthrough": header_passthrough,
-            "preserve_incoming_user_agent": preserve_incoming_user_agent,
-            "stream_auth_passthrough": stream_auth_passthrough
-        },
-        "headers": {
-            "incoming_user_agent": header_value_or_dash(incoming_headers, "user-agent"),
-            "upstream_user_agent": req_header_value_or_dash(built_req.headers(), "user-agent"),
-            "incoming_content_type": header_value_or_dash(incoming_headers, "content-type"),
-            "upstream_content_type": req_header_value_or_dash(built_req.headers(), "content-type"),
-            "incoming_host": header_value_or_dash(incoming_headers, "host"),
-            "upstream_host": built_req.url().host_str().unwrap_or("-")
-        }
-    });
-
-    serde_json::to_string(&compare_json).unwrap_or_else(|_| "{}".to_string())
-}
-
-fn non_empty_or_dash(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        "-".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn opt_non_empty_or_dash(value: Option<&str>) -> String {
-    value
-        .map(non_empty_or_dash)
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_upstream_setting_for_diag(upstream_server: &str, upstream_custom_url: &str) -> String {
-    if normalize_upstream_server(upstream_server) == "custom" {
-        format!("custom({})", non_empty_or_dash(upstream_custom_url))
-    } else {
-        "sandbox -> daily -> prod".to_string()
-    }
-}
-
-fn build_flow_diag_block(
-    official_ls_enabled: bool,
-    official_ls_running: bool,
-    http_protocol_mode: &str,
-    upstream_server: &str,
-    upstream_custom_url: &str,
-    request_model: Option<&str>,
-    effective_model: Option<&str>,
-    account_project_raw: &str,
-    resolved_project_resource: Option<&str>,
-    capacity_failover_enabled: bool,
-    upstream_attempts: &[String],
-) -> String {
-    let upstream_attempts_text = if upstream_attempts.is_empty() {
-        "-".to_string()
-    } else {
-        upstream_attempts.join("\n")
-    };
-    let ls_mode = if official_ls_enabled {
-        if official_ls_running { "official_ls (active)" } else { "official_ls (not running, fallback)" }
-    } else {
-        "direct"
-    };
-    format!(
-        "DIAG\nmode: {}\nhttp_protocol_mode: {}\nupstream_setting: {}\nrequest_model: {}\neffective_model: {}\naccount_project_raw: {}\nresolved_project_resource: {}\ncapacity_failover_enabled: {}\nupstream_attempts:\n{}",
-        ls_mode,
-        non_empty_or_dash(http_protocol_mode),
-        format_upstream_setting_for_diag(upstream_server, upstream_custom_url),
-        opt_non_empty_or_dash(request_model),
-        opt_non_empty_or_dash(effective_model),
-        non_empty_or_dash(account_project_raw),
-        opt_non_empty_or_dash(resolved_project_resource),
-        if capacity_failover_enabled { "true" } else { "false" },
-        upstream_attempts_text
-    )
-}
 
 // ==================== Context window limits per model ====================
 
@@ -1736,120 +1181,7 @@ fn context_window_limit(model: &str) -> u64 {
     200_000
 }
 
-// ==================== Token usage recording ====================
 
-struct UsageRecorder {
-    collected: Vec<u8>,
-    app: tauri::AppHandle,
-    email: String,
-    model: String,
-    flow_id: String,
-}
-
-impl Drop for UsageRecorder {
-    fn drop(&mut self) {
-        use tauri::Manager;
-        if self.collected.is_empty() {
-            return;
-        }
-        if let Some(app_state) = self.app.try_state::<crate::models::AppState>() {
-            if let Some((input, output, cache_read, cache_creation, total)) =
-                crate::token_stats::extract_usage_from_sse(&self.collected)
-            {
-                let email = std::mem::take(&mut self.email);
-                let model = std::mem::take(&mut self.model);
-                let flow_id = std::mem::take(&mut self.flow_id);
-                let model_for_ctx = model.clone();
-                emit_log(
-                    &self.app,
-                    &format!(
-                        "TokenStats [{}] model=[{}] in={} out={} cache_read={} cache_create={} total={}",
-                        email, model, input, output, cache_read, cache_creation, total
-                    ),
-                    "dim",
-                    None,
-                );
-                app_state
-                    .token_stats
-                    .record(crate::token_stats::TokenUsageRecord {
-                        timestamp: Utc::now().timestamp(),
-                        account_email: email,
-                        model,
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: cache_read,
-                        cache_creation_tokens: cache_creation,
-                        total_tokens: total,
-                    });
-                // Emit usage to frontend so flow entry can display real token counts
-                if !flow_id.is_empty() {
-                    let _ = self.app.emit("flow-usage", serde_json::json!({
-                        "flow_id": flow_id,
-                        "input_tokens": input,
-                        "output_tokens": output,
-                        "cache_read_tokens": cache_read,
-                        "cache_creation_tokens": cache_creation,
-                        "total_tokens": total,
-                    }));
-                }
-                // Update last_context_usage for the /context-info endpoint
-                // Push new entry and prune old ones using configurable window
-                let window_secs = *app_state.context_ring_window_secs.lock().unwrap();
-                if let Ok(mut ctx) = app_state.last_context_usage.lock() {
-                    let now = Utc::now().timestamp();
-                    ctx.push((input, model_for_ctx.clone(), now));
-                    ctx.retain(|&(_, _, ts)| now - ts < window_secs as i64);
-                }
-                // Always update the latest entry (never expires, prevents 0 bug)
-                if let Ok(mut latest) = app_state.context_usage_latest.lock() {
-                    *latest = (input, model_for_ctx);
-                }
-            }
-        }
-    }
-}
-
-fn record_non_sse_usage(
-    app: &tauri::AppHandle,
-    resp_body: &[u8],
-    email: &str,
-    model: &Option<String>,
-) {
-    use tauri::Manager;
-    if resp_body.is_empty() {
-        return;
-    }
-    if let Some(app_state) = app.try_state::<crate::models::AppState>() {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(resp_body) {
-            if let Some((input, output, cache_read, cache_creation, total)) =
-                crate::token_stats::parse_usage_auto(&json)
-            {
-                let model_str = model.clone().unwrap_or_default();
-                emit_log(
-                    app,
-                    &format!(
-                        "TokenStats [{}] model=[{}] in={} out={} cache_read={} cache_create={} total={}",
-                        email, model_str, input, output, cache_read, cache_creation, total
-                    ),
-                    "dim",
-                    None,
-                );
-                app_state
-                    .token_stats
-                    .record(crate::token_stats::TokenUsageRecord {
-                        timestamp: Utc::now().timestamp(),
-                        account_email: email.to_string(),
-                        model: model_str,
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: cache_read,
-                        cache_creation_tokens: cache_creation,
-                        total_tokens: total,
-                    });
-            }
-        }
-    }
-}
 
 fn build_http_client(protocol_mode: &str) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
@@ -1918,7 +1250,7 @@ async fn handle_proxy_request(
     providers: Arc<Mutex<Vec<AiProvider>>>,
     routing_strategy_arc: Arc<Mutex<String>>,
     header_passthrough_arc: Arc<Mutex<bool>>,
-    official_ls_enabled_arc: Arc<Mutex<bool>>,
+
     upstream_server_arc: Arc<Mutex<String>>,
     upstream_custom_url_arc: Arc<Mutex<String>>,
     http_protocol_mode_arc: Arc<Mutex<String>>,
@@ -1988,18 +1320,12 @@ async fn handle_proxy_request(
 
     let routing_strategy = routing_strategy_arc.lock().unwrap().clone();
     let header_passthrough = *header_passthrough_arc.lock().unwrap();
-    let official_ls_enabled = *official_ls_enabled_arc.lock().unwrap();
     let upstream_server = upstream_server_arc.lock().unwrap().clone();
     let upstream_custom_url = upstream_custom_url_arc.lock().unwrap().clone();
     let http_protocol_mode =
         normalize_http_protocol_mode(&http_protocol_mode_arc.lock().unwrap().clone());
     let capacity_failover_enabled = *capacity_failover_enabled_arc.lock().unwrap();
-    let official_ls_running = crate::ls_bridge::get_official_ls_https_base_url().await.is_some();
-    let effective_transport_mode = if official_ls_enabled && official_ls_running {
-        "official_ls".to_string()
-    } else {
-        "direct".to_string()
-    };
+    let effective_transport_mode = "direct".to_string();
 
     // Generate unique flow ID for real-time tracking across phases
     let flow_id = uuid::Uuid::new_v4().to_string();
@@ -2259,7 +1585,6 @@ async fn handle_proxy_request(
 
     let forward_targets = match resolve_forward_targets(
         &path_query,
-        official_ls_enabled,
         &upstream_server,
         &upstream_custom_url,
     ).await {
@@ -2387,8 +1712,7 @@ async fn handle_proxy_request(
 
         'target_loop: for target in &forward_targets {
             attempted_upstream_forward = true;
-            let is_primary_ls_target =
-                effective_transport_mode == "official_ls" && target.label == "official_ls";
+
             // Also fix empty project ID in URL path (e.g., /v1/projects//locations/...)
             let patched_url = if let Some(pr) = project_resource.as_deref() {
                 let pid = pr.strip_prefix("projects/").unwrap_or(pr);
@@ -2682,8 +2006,6 @@ async fn handle_proxy_request(
                             .map(|s| rewrite_request_preview_protocol(s, &upstream_protocol))
                             .unwrap_or_else(|| "<unavailable>".to_string());
                         let diag_block = build_flow_diag_block(
-                            official_ls_enabled,
-                            official_ls_running,
                             &http_protocol_mode,
                             &upstream_server,
                             &upstream_custom_url,
@@ -2786,8 +2108,6 @@ response: stream (SSE)
                         .map(|s| rewrite_request_preview_protocol(s, &upstream_protocol))
                         .unwrap_or_else(|| "<unavailable>".to_string());
                     let diag_block = build_flow_diag_block(
-                        official_ls_enabled,
-                        official_ls_running,
                         &http_protocol_mode,
                         &upstream_server,
                         &upstream_custom_url,
@@ -3014,11 +2334,7 @@ response_body:
                     &app,
                     &format!(
                         "{} [{} {}] -> {} ({} {}), body={}",
-                        if is_primary_ls_target {
-                            "LS返回非2xx，停止当前目标回退"
-                        } else {
-                            "转发非2xx，尝试下一个目标"
-                        },
+                        "转发非2xx，尝试下一个目标",
                         method,
                         path_query,
                         target.label,
@@ -3035,8 +2351,6 @@ response_body:
                     .map(|s| rewrite_request_preview_protocol(s, &upstream_protocol))
                     .unwrap_or_else(|| "<unavailable>".to_string());
                 let diag_block = build_flow_diag_block(
-                    official_ls_enabled,
-                    official_ls_running,
                     &http_protocol_mode,
                     &upstream_server,
                     &upstream_custom_url,
@@ -3100,37 +2414,6 @@ response_body:
                 };
                 let non_success_response = builder.body(full_body(resp_body)).unwrap();
 
-                if is_primary_ls_target {
-                    let allow_ls_fallback = matches!(status.as_u16(), 404 | 500 | 502 | 503 | 504);
-                    if allow_ls_fallback {
-                        emit_log(
-                            &app,
-                            &format!(
-                                "网关在 [{} {}] 返回 {}，回退直连上游目标",
-                                status.as_u16(),
-                                method,
-                                path_query
-                            ),
-                            "warning",
-                            None,
-                        );
-                    } else {
-                        emit_request_summary_log(
-                            &app,
-                            &method,
-                            &path_query,
-                            &effective_transport_mode,
-                            &selected_email,
-                            &target.label,
-                            status.as_u16(),
-                            request_started.elapsed().as_millis(),
-                            non_success_details,
-                            &flow_id,
-                            &flow_timestamp,
-                        );
-                        return Ok(non_success_response);
-                    }
-                }
 
                 pending_non_success_details = Some(non_success_details);
                 pending_non_success = Some(non_success_response);
@@ -3168,8 +2451,6 @@ response_body:
             None,
         );
         let diag_block = build_flow_diag_block(
-            official_ls_enabled,
-            official_ls_running,
             &http_protocol_mode,
             &upstream_server,
             &upstream_custom_url,
@@ -3372,27 +2653,7 @@ pub async fn start_proxy(
         return Err("代理已在运行".to_string());
     }
 
-    let official_ls_enabled_precheck = *state.official_ls_enabled.lock().unwrap();
-    if official_ls_enabled_precheck {
-        match crate::ls_bridge::is_official_ls_binary_available() {
-            true => {
-                emit_log(
-                    &app,
-                    "official_ls pre-check passed: binary found",
-                    "info",
-                    None,
-                );
-            }
-            false => {
-                emit_log(
-                    &app,
-                    "official_ls pre-check: binary not found, will use direct upstream",
-                    "warning",
-                    None,
-                );
-            }
-        }
-    }
+
 
     let (cert_path, key_path) = ensure_cert_exists()?;
 
@@ -3424,7 +2685,7 @@ pub async fn start_proxy(
     let providers = state.providers.clone();
     let routing_strategy = state.routing_strategy.clone();
     let header_passthrough = state.header_passthrough.clone();
-    let official_ls_enabled = state.official_ls_enabled.clone();
+
     let upstream_server = state.upstream_server.clone();
     let upstream_custom_url = state.upstream_custom_url.clone();
     let http_protocol_mode = state.http_protocol_mode.clone();
@@ -3479,7 +2740,7 @@ pub async fn start_proxy(
                         let providers = providers.clone();
                         let routing_strategy = routing_strategy.clone();
                         let header_passthrough = header_passthrough.clone();
-                        let official_ls_enabled = official_ls_enabled.clone();
+
                         let upstream_server = upstream_server.clone();
                         let upstream_custom_url = upstream_custom_url.clone();
                         let http_protocol_mode = http_protocol_mode.clone();
@@ -3494,7 +2755,7 @@ pub async fn start_proxy(
                                 let providers_inner = providers.clone();
                                 let routing_strategy_inner = routing_strategy.clone();
                                 let header_passthrough_inner = header_passthrough.clone();
-                                let official_ls_enabled_inner = official_ls_enabled.clone();
+
                                 let upstream_server_inner = upstream_server.clone();
                                 let upstream_custom_url_inner = upstream_custom_url.clone();
                                 let http_protocol_mode_inner = http_protocol_mode.clone();
@@ -3511,7 +2772,7 @@ pub async fn start_proxy(
                                         providers_inner.clone(),
                                         routing_strategy_inner.clone(),
                                         header_passthrough_inner.clone(),
-                                        official_ls_enabled_inner.clone(),
+
                                         upstream_server_inner.clone(),
                                         upstream_custom_url_inner.clone(),
                                         http_protocol_mode_inner.clone(),
@@ -3525,7 +2786,11 @@ pub async fn start_proxy(
                                     .serve_connection(TokioIo::new(tls_stream), service)
                                     .await
                                 {
-                                    emit_log(&app_inner, &format!("连接处理失败: {:?}", err), "error", None);
+                                    // Filter out harmless TLS probe disconnections (IDE connects then immediately drops)
+                                    let err_msg = format!("{:?}", err);
+                                    if !err_msg.contains("UnexpectedEof") && !err_msg.contains("close_notify") {
+                                        emit_log(&app_inner, &format!("连接处理失败: {}", err_msg), "error", None);
+                                    }
                                 }
                                 }
                                 Err(tls_err) => {

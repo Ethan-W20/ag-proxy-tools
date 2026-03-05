@@ -45,8 +45,9 @@ const CURRENT_ACCOUNT_INDEX_KEY = 'ag-current-account-index';
 const UI_LANGUAGE_KEY = 'ag-ui-language';
 let credentialsLoading = false;
 let credentialsLoadRunId = 0;
-const ACCOUNT_LOAD_UI_INTERVAL_MS = 80;
-const ACCOUNT_LOAD_UI_WARMUP_MS = 220;
+const ACCOUNT_LOAD_UI_INTERVAL_MS = 30;
+const ACCOUNT_LOAD_UI_WARMUP_MS = 150;
+const ACCOUNT_LOAD_BATCH_SIZE = 1;
 let streamingAccountsUiMode = false;
 let dashboardMetricsRefreshTimer = null;
 let dashboardMetricsLoading = false;
@@ -155,12 +156,8 @@ const UI_STATIC_TEXT = {
   settAutoStartDesc: { zh: '开启后软件启动时自动启动代理服务，无需手动点击', en: 'Automatically start proxy when app launches' },
   settPortLabel: { zh: '代理端口', en: 'Proxy Port' },
   settPortDesc: { zh: '本地代理监听端口，用于接收 IDE 请求并转发到上游', en: 'Local proxy listen port for IDE request forwarding' },
-  settOfficialLsLabel: { zh: '官方 LS 转发', en: 'Official LS Forwarding' },
-  settOfficialLsDesc: { zh: '通过官方 Language Server 转发请求到 Google Cloud（推荐开启）', en: 'Forward requests via Official Language Server to Google Cloud (recommended)' },
   settHttpProtocolLabel: { zh: '上游 HTTP 协议', en: 'Upstream HTTP Protocol' },
   settAutoProtoLabel: { zh: '自动', en: 'Auto' },
-  settCapacityLabel: { zh: '模型互补', en: 'Capacity Failover' },
-  settCapacityDesc: { zh: '仅针对 opus/sonnet thinking 自动重试并互切', en: 'Auto-retry with complementary model (opus/sonnet thinking)' },
   settUpstreamLabel: { zh: '上游服务器', en: 'Upstream Server' },
   settUpstreamDesc: { zh: 'Google Cloud Code PA API 端点', en: 'Google Cloud Code PA API endpoint' },
   settPassthroughLabel: { zh: '透传模式', en: 'Header Passthrough' },
@@ -190,6 +187,22 @@ const UI_STATIC_TEXT = {
   sidebarProxyStatus: { zh: '代理未启动', en: 'Proxy not started' },
   initialLogLine: { zh: '[系统] 等待代理启动...', en: '[System] Waiting for proxy to start...' },
   patchModalHint: { zh: '留空则默认使用本地代理地址：', en: 'Leave empty to use local proxy address:' },
+  // Context ring settings modal
+  ctxRingModalTitle: { zh: '⚙️ 统计设置', en: '⚙️ Stats Settings' },
+  ctxRingWindowLabel: { zh: '滑动窗口 (秒)', en: 'Sliding Window (seconds)' },
+  ctxRingWindowDesc: { zh: '取最近 N 秒内的最大 token 值，过滤后台小请求造成的波动', en: 'Use max token value within last N seconds, filtering noise from small background requests' },
+  ctxRingCancelBtn: { zh: '取消', en: 'Cancel' },
+  ctxRingSaveBtn: { zh: '保存', en: 'Save' },
+  // Provider modal
+  provModalTitle: { zh: '🔗 AI 供应商', en: '🔗 AI Providers' },
+  provModalAddBtn: { zh: '添加', en: 'Add' },
+  // Auto-accept settings modal
+  aaModalTitle: { zh: ' 自动审批设置', en: ' Auto-Approve Settings' },
+  aaPatternLabel: { zh: '审批按钮类型', en: 'Approve Button Types' },
+  aaBannedLabel: { zh: '🛡️ 安全规则（每行一条，含关键词的命令不自动执行）', en: '🛡️ Safety Rules (one per line, commands containing keywords won\'t auto-execute)' },
+  aaResetBtn: { zh: '重置默认', en: 'Reset Default' },
+  aaCancelBtn: { zh: '取消', en: 'Cancel' },
+  aaSaveBtn: { zh: '保存设置', en: 'Save Settings' },
 };
 
 function uiText(zh, en) {
@@ -554,137 +567,7 @@ async function restoreRoutingStrategy() {
 
 // ==================== Official LS ====================
 
-async function onOfficialLsToggle(enabled) {
-  try {
-    const saved = await invoke('set_official_ls_enabled', { enabled: !!enabled });
-    const toggle = document.getElementById('officialLsToggle');
-    if (toggle) toggle.checked = !!saved;
-    if (saved) {
-      await ensureOfficialLsRunningFromSelectedAccount();
-    } else {
-      try {
-        await invoke('stop_official_ls');
-      } catch (stopErr) {
-        console.warn('Failed to stop official LS after disabling:', stopErr);
-      }
-    }
-    showToast(saved
-      ? uiText('已开启官方 LS 转发', 'Official LS forwarding enabled')
-      : uiText('已关闭官方 LS 转发', 'Official LS forwarding disabled'),
-      'success'
-    );
-    await refreshOfficialLsStatusUI();
-  } catch (e) {
-    showToast(uiText('设置 LS 转发失败: ', 'Failed to set LS forwarding: ') + e, 'error');
-  }
-}
-
-async function restoreOfficialLsEnabled() {
-  try {
-    const enabled = await invoke('get_official_ls_enabled');
-    const toggle = document.getElementById('officialLsToggle');
-    if (toggle) toggle.checked = !!enabled;
-  } catch (e) {
-    console.error('Failed to restore LS enabled state:', e);
-  }
-}
-
-function getBestAccountForOfficialLsStart() {
-  if (!Array.isArray(state.accounts) || state.accounts.length === 0) return null;
-  const current = (state.currentIdx >= 0 && state.currentIdx < state.accounts.length)
-    ? state.accounts[state.currentIdx]
-    : null;
-  const hasToken = (acc) => !!(acc && !acc.disabled && String(acc.refresh_token || '').trim());
-  if (hasToken(current)) return current;
-  return state.accounts.find(hasToken) || null;
-}
-
-async function ensureOfficialLsRunningFromSelectedAccount() {
-  if (!window.__TAURI__) return false;
-  const enabled = await invoke('get_official_ls_enabled');
-  if (!enabled) return false;
-
-  const status = await invoke('get_official_ls_status');
-  if (status && status.running) return true;
-
-  const account = getBestAccountForOfficialLsStart();
-  if (!account) {
-    addLog(uiText('官方 LS 启动跳过：没有可用账号', 'Official LS start skipped: no available account'), 'warning');
-    return false;
-  }
-
-  const accessToken = String(account.access_token || '').trim();
-  const refreshToken = String(account.refresh_token || '').trim();
-  const expiry = Number(account.expiry_timestamp || 0) || 0;
-
-  if (!refreshToken) {
-    addLog(uiText(`官方 LS 启动跳过：账号缺少 refresh_token [${account.email}]`, `Official LS start skipped: missing refresh_token [${account.email}]`), 'warning');
-    return false;
-  }
-
-  try {
-    await invoke('start_official_ls', { accessToken, refreshToken, expiry });
-    await refreshOfficialLsStatusUI();
-    return true;
-  } catch (e) {
-    addLog(uiText(`官方 LS 启动失败 [${account.email}]`, `Official LS start failed [${account.email}]`), 'warning', String(e));
-    await refreshOfficialLsStatusUI();
-    return false;
-  }
-}
-
-async function refreshOfficialLsStatusUI() {
-  try {
-    const status = await invoke('get_official_ls_status');
-    renderOfficialLsStatus(status);
-  } catch (e) {
-    renderOfficialLsStatus(null, String(e));
-  }
-}
-
-function renderOfficialLsStatus(status, overrideText = '') {
-  const statusEl = document.getElementById('officialLsStatus');
-  const binaryEl = document.getElementById('officialLsBinaryInfo');
-
-  if (statusEl) {
-    if (overrideText) {
-      statusEl.textContent = uiText(`LS 状态：${overrideText}`, `LS Status: ${overrideText}`);
-      statusEl.style.color = '#ef4444';
-    } else if (!status) {
-      statusEl.textContent = uiText('LS 状态：未获取', 'LS Status: Not available');
-      statusEl.style.color = '#9ca3af';
-    } else if (status.running) {
-      const port = status.https_port ? `:${status.https_port}` : '';
-      const pid = status.pid ? ` PID=${status.pid}` : '';
-      statusEl.textContent = uiText(
-        `LS 状态：运行中${port}${pid}`,
-        `LS Status: Running${port}${pid}`
-      );
-      statusEl.style.color = '#22c55e';
-    } else {
-      const err = status.last_error ? ` (${status.last_error})` : '';
-      statusEl.textContent = uiText(
-        `LS 状态：未运行${err}`,
-        `LS Status: Not running${err}`
-      );
-      statusEl.style.color = status.last_error ? '#ef4444' : '#9ca3af';
-    }
-  }
-
-  if (binaryEl) {
-    if (status && status.binary_path) {
-      binaryEl.textContent = uiText(
-        `二进制文件：${status.binary_path}`,
-        `Binary: ${status.binary_path}`
-      );
-      binaryEl.style.color = '#22c55e';
-    } else {
-      binaryEl.textContent = uiText('二进制文件：未找到', 'Binary: Not found');
-      binaryEl.style.color = '#f59e0b';
-    }
-  }
-}
-
+// [REMOVED] Official LS functions removed  feature deleted
 function normalizeHttpProtocolMode(mode) {
   const normalized = String(mode || '').trim().toLowerCase();
   if (normalized === 'http10' || normalized === 'h10' || normalized === 'http1.0' || normalized === '1.0') return 'http10';
@@ -729,30 +612,6 @@ async function restoreHttpProtocolMode() {
     updateHttpProtocolModeUI('auto');
   }
 }
-
-async function onCapacityFailoverChange(enabled) {
-  try {
-    const saved = await invoke('set_capacity_failover_enabled', { enabled: !!enabled });
-    const toggle = document.getElementById('capacityFailoverToggle');
-    if (toggle) toggle.checked = !!saved;
-    showToast(saved ? uiText('已开启模型互补', 'Model failover enabled') : uiText('已关闭模型互补', 'Model failover disabled'), 'success');
-  } catch (e) {
-    showToast(uiText('设置容量自动重试失败: ', 'Capacity failover setting failed: ') + e, 'error');
-    await restoreCapacityFailover();
-  }
-}
-
-async function restoreCapacityFailover() {
-  try {
-    const enabled = await invoke('get_capacity_failover_enabled');
-    const toggle = document.getElementById('capacityFailoverToggle');
-    if (toggle) toggle.checked = !!enabled;
-  } catch (e) {
-    console.error('Failed to restore capacity failover setting:', e);
-  }
-}
-
-
 
 function updateUpstreamServerUI(server) {
   const select = document.getElementById('upstreamServer');
@@ -1033,14 +892,20 @@ async function loadCredentials() {
                   cleanup();
                   return;
                 }
-                const next = pendingAccounts.shift();
-                if (next) {
-                  const insertIdx = state.accounts.length;
-                  state.accounts.push(next);
+                // Batch flush: process multiple accounts per tick
+                const batchSize = Math.min(pendingAccounts.length, ACCOUNT_LOAD_BATCH_SIZE);
+                if (batchSize > 0) {
                   const searchQuery = (document.getElementById('accountSearch')?.value || '').trim();
-                  if (streamingAccountsUiMode && !searchQuery) {
-                    appendLoadedAccountCard(next, insertIdx);
-                  } else {
+                  const useAppend = streamingAccountsUiMode && !searchQuery;
+                  for (let i = 0; i < batchSize; i++) {
+                    const next = pendingAccounts.shift();
+                    const insertIdx = state.accounts.length;
+                    state.accounts.push(next);
+                    if (useAppend) {
+                      appendLoadedAccountCard(next, insertIdx);
+                    }
+                  }
+                  if (!useAppend) {
                     renderAccounts();
                   }
                   updateAccountLoadProgressUI();
@@ -1541,7 +1406,7 @@ async function fetchAllQuotasUI() {
 
 async function fetchSingleQuota(idx) {
   try {
-    showToast(`正在查询 ${state.accounts[idx]?.email} 的额度...`, 'info');
+    showToast(uiText(`正在查询 ${state.accounts[idx]?.email} 的额度...`, `Querying quota for ${state.accounts[idx]?.email}...`), 'info');
     const quota = await invoke('fetch_quota', { index: idx });
     const email = state.accounts[idx]?.email;
     if (email) {
@@ -1555,7 +1420,7 @@ async function fetchSingleQuota(idx) {
     }
     await syncAccountStateFromBackend();
     renderAccounts();
-    showToast(`${email} 额度查询完成`, 'success');
+    showToast(uiText(`${email} 额度查询完成`, `Quota query complete for ${email}`), 'success');
   } catch (e) {
     const account = state.accounts[idx];
     if (account) {
@@ -1780,7 +1645,7 @@ async function resetTokenStats() {
   if (!confirm(uiText('确定要重置全部 Token 统计吗？此操作不可恢复。', 'Reset all token stats? This cannot be undone.'))) return;
   try {
     const result = await invoke('reset_token_stats');
-    showToast(result || 'Token 统计已重置', 'success');
+    showToast(result || uiText('Token 统计已重置', 'Token stats reset'), 'success');
     await loadTokenStats();
   } catch (e) {
     showToast(uiText('重置 Token 统计失败: ', 'Failed to reset token stats: ') + e, 'error');
@@ -1788,8 +1653,20 @@ async function resetTokenStats() {
 }
 
 async function toggleProxy() {
+  const proxyBtn = document.getElementById('proxyToggleBtn');
+  const wasRunning = state.proxyRunning;
+
+  // Show immediate loading feedback before IPC call
+  if (proxyBtn) {
+    proxyBtn.disabled = true;
+    proxyBtn.innerHTML = `<span class="spinner-sm"></span> <span>${wasRunning ? uiText('停止中...', 'Stopping...') : uiText('启动中...', 'Starting...')}</span>`;
+  }
+
+  // Let browser render the loading state before blocking on invoke
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
   try {
-    if (state.proxyRunning) {
+    if (wasRunning) {
       await invoke('stop_proxy');
       state.proxyRunning = false;
       showToast(uiText('代理已停止', 'Proxy stopped'), 'info');
@@ -1798,10 +1675,12 @@ async function toggleProxy() {
       state.proxyRunning = true;
       showToast(uiText('代理已启动', 'Proxy started'), 'success');
     }
-    updateDashboard();
-    queueDashboardMetricsRefresh(300);
   } catch (e) {
     showToast(uiText('操作失败: ', 'Operation failed: ') + e, 'error');
+  } finally {
+    if (proxyBtn) proxyBtn.disabled = false;
+    updateDashboard();
+    queueDashboardMetricsRefresh(300);
   }
 }
 
@@ -1858,7 +1737,7 @@ async function killPortProcess() {
 }
 
 function showAddProviderForm() {
-  document.getElementById('providerFormTitle').textContent = '添加 AI 供应商';
+  document.getElementById('providerFormTitle').textContent = uiText('添加 AI 供应商', 'Add AI Provider');
   document.getElementById('providerEditIndex').value = '-1';
   document.getElementById('providerName').value = '';
   document.getElementById('providerBaseUrl').value = '';
@@ -1873,7 +1752,7 @@ function showEditProviderForm(idx) {
   const provider = state.providers[idx];
   if (!provider) return;
 
-  document.getElementById('providerFormTitle').textContent = '编辑 AI 供应商';
+  document.getElementById('providerFormTitle').textContent = uiText('编辑 AI 供应商', 'Edit AI Provider');
   document.getElementById('providerEditIndex').value = idx;
   document.getElementById('providerName').value = provider.name || '';
   document.getElementById('providerBaseUrl').value = provider.base_url || '';
@@ -1979,7 +1858,7 @@ async function saveProvider() {
   renderProviders();
   hideProviderForm();
   persistProviders();
-  showToast(`供应商 "${name}" 已保存`, 'success');
+  showToast(uiText(`供应商 "${name}" 已保存`, `Provider "${name}" saved`), 'success');
 }
 
 async function deleteProvider(idx) {
@@ -2312,7 +2191,7 @@ function renderFlowEntry(flow) {
       <span class="flow-entry-method">${escapeHtml(flow.method)}</span>
       <span class="flow-entry-path" title="${escapeHtml(flow.path)}">${escapeHtml(pathShort)}</span>
       <span class="flow-entry-account" title="${escapeHtml(flow.account)}">${escapeHtml(flow.account)}</span>
-      <span class="flow-entry-mode">${flow.mode === 'official_ls' ? '\u{1f517}LS' : flow.mode === '\u7f51\u5173' ? '\u{1f310}\u7f51\u5173' : '\u{1f4e1}\u76f4\u8fde'}</span>
+      <span class="flow-entry-mode">${flow.mode === '\u7f51\u5173' ? '\u{1f310}\u7f51\u5173' : '\u{1f4e1}\u76f4\u8fde'}</span>
 
       <span class="flow-entry-status ${statusCls} flow-status-chip ${isFinished ? '' : 'flow-status-pulsing'}" data-flow-dir="summary" title="点击查看该请求总结" onclick="openFlowDetailFromStatus(this, event)">${isFinished ? (flow.final_status || 'ERR') : ({ received: '\u23f3\u63a5\u6536', forwarding: '\u{1f504}\u8f6c\u53d1', streaming: '\u{1f4e1}\u6d41\u5f0f' }[phase] || phase)}</span>
       <span class="flow-entry-elapsed">${isFinished ? flow.elapsed_ms + 'ms' : flow.elapsed_ms + 'ms\u2026'}</span>
@@ -2531,7 +2410,7 @@ function updateFlowUsage(usage) {
     const inp = usage.input_tokens || 0;
     const out = usage.output_tokens || 0;
     const total = usage.total_tokens || 0;
-    usageBadge.innerHTML = `<span title="总计/Total">${formatTokenK(total)}</span>›<span title="输入/Input">${formatTokenK(inp)}</span>›<span title="输出/Output">${formatTokenK(out)}</span>`;
+    usageBadge.innerHTML = `<span title="${uiText('总计', 'Total')}">${formatTokenK(total)}</span>›<span title="${uiText('输入', 'Input')}">${formatTokenK(inp)}</span>›<span title="${uiText('输出', 'Output')}">${formatTokenK(out)}</span>`;
     usageBadge.title = `Total: ${total.toLocaleString()} | Input: ${inp.toLocaleString()} | Output: ${out.toLocaleString()}`;
   }
 }
@@ -2666,7 +2545,7 @@ function addLog(msg, type = '', details = null) {
 function clearLogs() {
   const logArea = document.getElementById('logArea');
   if (!logArea) return;
-  logArea.innerHTML = '<div class="log-line dim">[系统] 日志已清空</div>';
+  logArea.innerHTML = `<div class="log-line dim">${uiText('[系统] 日志已清空', '[System] Logs cleared')}</div>`;
 }
 
 let currentLogMode = 'all'; // 'all' | 'error' | 'flow'
@@ -2837,13 +2716,7 @@ async function mockInvoke(cmd, args) {
       return !!args?.enabled;
     case 'get_header_passthrough':
       return true;
-    case 'set_transport_mode': {
-      const mode = args?.mode === 'client_gateway' ? 'client_gateway' : 'legacy';
-      localStorage.setItem('ag-mock-transport-mode', mode);
-      return mode;
-    }
-    case 'get_transport_mode':
-      return localStorage.getItem('ag-mock-transport-mode') || 'legacy';
+
     case 'set_http_protocol_mode': {
       const mode = String(args?.mode || '').toLowerCase();
       const normalized = ['auto', 'http10', 'http1', 'http2'].includes(mode) ? mode : 'auto';
@@ -2852,13 +2725,6 @@ async function mockInvoke(cmd, args) {
     }
     case 'get_http_protocol_mode':
       return localStorage.getItem('ag-mock-http-protocol-mode') || 'auto';
-    case 'set_capacity_failover_enabled': {
-      const enabled = !!args?.enabled;
-      localStorage.setItem('ag-mock-capacity-failover-enabled', enabled ? '1' : '0');
-      return enabled;
-    }
-    case 'get_capacity_failover_enabled':
-      return localStorage.getItem('ag-mock-capacity-failover-enabled') !== '0';
     case 'set_upstream_server': {
       const server = String(args?.server || '').toLowerCase();
       return server === 'custom' ? 'custom' : 'sandbox';
@@ -2869,21 +2735,6 @@ async function mockInvoke(cmd, args) {
       return String(args?.customUrl || '').trim();
     case 'get_upstream_custom_url':
       return localStorage.getItem('ag-upstream-custom-url') || '';
-    case 'set_official_ls_enabled': {
-      const enabled = !!args?.enabled;
-      localStorage.setItem('ag-mock-official-ls-enabled', enabled ? '1' : '0');
-      return enabled;
-    }
-    case 'get_official_ls_enabled':
-      return localStorage.getItem('ag-mock-official-ls-enabled') !== '0';
-    case 'get_official_ls_status':
-      return { running: false, pid: null, binary_path: '', https_port: null, last_error: null };
-    case 'start_official_ls':
-      return 'Official LS started';
-    case 'stop_official_ls':
-      return 'Official LS stopped';
-    case 'check_official_ls_binary':
-      return { available: false, path: '' };
     case 'get_token_stats':
       return {
         total_input: 0,
@@ -3065,50 +2916,58 @@ async function runStartupStep(name, step) {
 }
 
 async function bootstrapApp() {
-  await runStartupStep('Restore UI language', async () => {
-    restoreUiLanguage();
-  });
-  await runStartupStep('Restore theme', async () => {
-    restoreTheme();
-  });
-  await runStartupStep('Bind settings events', async () => {
-    restoreSettings();
-  });
-  await runStartupStep('Restore port config', restorePortConfig);
-  await runStartupStep('Restore upstream server', restoreUpstreamServerConfig);
-  await runStartupStep('Restore official LS', restoreOfficialLsEnabled);
-  await runStartupStep('Restore HTTP protocol', restoreHttpProtocolMode);
-  await runStartupStep('Restore capacity failover', restoreCapacityFailover);
-  await runStartupStep('Refresh LS status', refreshOfficialLsStatusUI);
-  await runStartupStep('Restore routing strategy', restoreRoutingStrategy);
-  await runStartupStep('Restore quota threshold', restoreQuotaThreshold);
-  await runStartupStep('Restore header passthrough', restoreHeaderPassthrough);
+  // Phase 1: Synchronous UI restoration (instant, no IPC)
+  restoreUiLanguage();
+  restoreTheme();
+  restoreSettings();
   restoreAutoQuotaRefreshSetting();
   restoreAutoStartProxySetting();
   addLog(uiText('系统初始化中...', 'System initializing...'), 'dim');
-  await runStartupStep('Initialize log listener', initLogs);
-  await runStartupStep('Initialize flow listener', initFlowListener);
-  await runStartupStep('Initialize account switch listener', initAccountSwitchListener);
+
+  // Phase 2: Fire ALL independent backend invokes in parallel
+  // These are independent settings reads that don't depend on each other
+  const settingsPromises = [
+    runStartupStep('Restore port config', restorePortConfig),
+    runStartupStep('Restore upstream server', restoreUpstreamServerConfig),
+    runStartupStep('Restore HTTP protocol', restoreHttpProtocolMode),
+    runStartupStep('Restore routing strategy', restoreRoutingStrategy),
+    runStartupStep('Restore quota threshold', restoreQuotaThreshold),
+    runStartupStep('Restore header passthrough', restoreHeaderPassthrough),
+  ];
+
+  // Phase 3: Register event listeners in parallel (also independent)
+  const listenerPromises = [
+    runStartupStep('Initialize log listener', initLogs),
+    runStartupStep('Initialize flow listener', initFlowListener),
+    runStartupStep('Initialize account switch listener', initAccountSwitchListener),
+  ];
+
+  // Phase 4: Start account loading early — don't wait for settings
+  const accountPromise = runStartupStep('Load accounts', loadCredentials);
+
+  // Wait for all parallel tasks to complete
+  await Promise.allSettled([...settingsPromises, ...listenerPromises, accountPromise]);
+
+  // Phase 5: Non-critical tasks after main loading is done
   deferNonCriticalStartupChecks();
   await runStartupStep('Refresh dashboard', () => refreshDashboardMetrics({ silent: true }));
-  await runStartupStep('Load accounts', loadCredentials);
-  await runStartupStep('Ensure official LS running', ensureOfficialLsRunningFromSelectedAccount);
+
   await runStartupStep('Load providers', async () => {
     loadProviders();
   });
 
-  // Auto-start proxy: wait until accounts are loaded and synced to backend
+  // Auto-start proxy: accounts are already loaded at this point
   if (localStorage.getItem('ag-auto-start-proxy') === '1' && !state.proxyRunning) {
     if (state.accounts.length === 0) {
       addLog(uiText('自动启动代理：无可用账号，跳过自动启动', 'Auto-start proxy: no available accounts, skipping'), 'warning');
     } else {
-      // Wait for switch_account invoke to complete (async inside restoreCurrentAccountSelection)
+      // Short delay to let switch_account sync complete
       setTimeout(async () => {
         if (!state.proxyRunning) {
           addLog(uiText('自动启动代理...', 'Auto-starting proxy...'), 'dim');
           await toggleProxy();
         }
-      }, 1200);
+      }, 500);
     }
   }
 }

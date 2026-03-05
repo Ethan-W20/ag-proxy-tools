@@ -297,6 +297,13 @@ fn is_auth_related_quota_error(err: &str) -> bool {
         || lower.contains("invalid grant")
 }
 
+fn is_persistent_account_issue_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "auth_invalid_grant" | "auth_verification_required" | "auth_unauthorized"
+    )
+}
+
 fn set_account_quota_error(
     accounts: &mut [crate::models::Account],
     idx: usize,
@@ -392,7 +399,8 @@ pub async fn fetch_quota(
                 {
                     let mut accounts = state.accounts.lock().unwrap();
                     if idx < accounts.len() {
-                        if should_disable_account_for_error_kind(&kind) {
+                        // If we still have a cached access token, keep account enabled for fallback fetch.
+                        if should_disable_account_for_error_kind(&kind) && token.is_empty() {
                             mark_account_disabled(
                                 &mut accounts,
                                 idx,
@@ -435,6 +443,8 @@ pub async fn fetch_quota(
             {
                 let mut accounts = state.accounts.lock().unwrap();
                 if idx < accounts.len() {
+                    // A successful quota API round-trip means account is still usable.
+                    clear_account_disabled(&mut accounts, idx);
                     if let Some(err) = error {
                         set_account_quota_error(
                             &mut accounts,
@@ -603,32 +613,35 @@ pub async fn fetch_all_quotas(
                                 None,
                             );
 
-                            let mut account_to_persist = None;
-                            {
-                                let mut accounts = accounts_ref.lock().unwrap();
-                                if idx < accounts.len() {
-                                    if should_disable_account_for_error_kind(&kind) {
-                                        mark_account_disabled(
-                                            &mut accounts,
-                                            idx,
-                                            format!("invalid_grant: {}", e),
-                                        );
-                                    }
-                                    set_account_quota_error(
-                                        &mut accounts,
-                                        idx,
-                                        Some(kind),
-                                        None,
-                                        format!("OAuth error: {}", e),
-                                    );
-                                    account_to_persist = Some(accounts[idx].clone());
-                                }
-                            }
-                            if let Some(account) = account_to_persist {
-                                let _ = crate::account::persist_account(&account);
-                            }
-
                             if access_token.is_empty() {
+                                let mut account_to_persist = None;
+                                {
+                                    let mut accounts = accounts_ref.lock().unwrap();
+                                    if idx < accounts.len() {
+                                        if should_disable_account_for_error_kind(&kind) {
+                                            mark_account_disabled(
+                                                &mut accounts,
+                                                idx,
+                                                format!("invalid_grant: {}", e),
+                                            );
+                                        }
+                                        if is_persistent_account_issue_kind(&kind) {
+                                            set_account_quota_error(
+                                                &mut accounts,
+                                                idx,
+                                                Some(kind),
+                                                None,
+                                                format!("OAuth error: {}", e),
+                                            );
+                                        } else {
+                                            clear_account_quota_error(&mut accounts, idx);
+                                        }
+                                        account_to_persist = Some(accounts[idx].clone());
+                                    }
+                                }
+                                if let Some(account) = account_to_persist {
+                                    let _ = crate::account::persist_account(&account);
+                                }
                                 return Err(e);
                             }
                             emit_log(
@@ -651,6 +664,8 @@ pub async fn fetch_all_quotas(
                         {
                             let mut accounts = accounts_ref.lock().unwrap();
                             if idx < accounts.len() {
+                                // A successful quota API round-trip means account is still usable.
+                                clear_account_disabled(&mut accounts, idx);
                                 if let Some(err) = error {
                                     set_account_quota_error(
                                         &mut accounts,
@@ -697,13 +712,18 @@ pub async fn fetch_all_quotas(
                                         format!("invalid_grant: {}", final_err),
                                     );
                                 }
-                                set_account_quota_error(
-                                    &mut accounts,
-                                    idx,
-                                    Some(kind),
-                                    None,
-                                    final_err.clone(),
-                                );
+                                if is_persistent_account_issue_kind(&kind) {
+                                    set_account_quota_error(
+                                        &mut accounts,
+                                        idx,
+                                        Some(kind),
+                                        None,
+                                        final_err.clone(),
+                                    );
+                                } else {
+                                    // Batch refresh may fail transiently under concurrency; don't pin account as abnormal.
+                                    clear_account_quota_error(&mut accounts, idx);
+                                }
                                 account_to_persist = Some(accounts[idx].clone());
                             }
                         }

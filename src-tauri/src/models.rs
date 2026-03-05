@@ -73,7 +73,7 @@ pub struct AppState {
     pub providers: Arc<Mutex<Vec<AiProvider>>>,
     pub routing_strategy: Arc<Mutex<String>>,
     pub header_passthrough: Arc<Mutex<bool>>,
-    pub official_ls_enabled: Arc<Mutex<bool>>,
+
     pub upstream_server: Arc<Mutex<String>>,
     pub upstream_custom_url: Arc<Mutex<String>>,
     pub http_protocol_mode: Arc<Mutex<String>>,
@@ -108,7 +108,7 @@ pub struct QuotaData {
 /// A single hop in the request flow chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowHop {
-    pub node: String,       // e.g. "Client", "Local Proxy", "Official LS", "Upstream"
+    pub node: String,       // e.g. "Client", "Local Proxy", "Upstream"
     pub status: Option<u16>,
     pub detail: Option<String>,
 }
@@ -127,7 +127,7 @@ pub struct RequestFlowPayload {
     pub method: String,
     pub path: String,
     pub account: String,
-    pub mode: String,               // "direct" / "official_ls" / "网关" / "proxy"
+    pub mode: String,               // "direct" / "网关" / "proxy"
     pub phase: String,              // "received" / "forwarding" / "streaming" / "completed" / "error"
     pub target: Option<String>,     // upstream target URL or label
     /// Forward hops (request direction →)

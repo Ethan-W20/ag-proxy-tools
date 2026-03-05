@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN" data-theme="light">
 
 <head>
@@ -541,7 +541,8 @@
             style="background:var(--bg-card, #18181b); border:1px solid var(--border, #27272a); border-radius:12px; width:400px; max-width:92vw; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden;">
             <div
               style="padding:16px 20px; border-bottom:1px solid var(--border, #27272a); display:flex; justify-content:space-between; align-items:center;">
-              <span style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">⚙️ 统计设置</span>
+              <span id="ctxRingModalTitle"
+                style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">⚙️ 统计设置</span>
               <button onclick="hideContextRingSettings()"
                 style="background:none; border:none; color:var(--text-secondary, #a1a1aa); font-size:20px; cursor:pointer; line-height:1;">✕</button>
             </div>
@@ -549,9 +550,11 @@
               <div style="margin-bottom:16px;">
                 <div
                   style="font-size:11px; color:var(--text-secondary, #a1a1aa); margin-bottom:6px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px;">
-                  滑动窗口 (秒)</div>
+                  <span id="ctxRingWindowLabel">滑动窗口 (秒)</span>
+                </div>
                 <p style="font-size:11px; color:var(--text-secondary, #71717a); margin:0 0 10px; line-height:1.5;">
-                  取最近 N 秒内的最大 token 值，过滤后台小请求造成的波动</p>
+                  <span id="ctxRingWindowDesc">取最近 N 秒内的最大 token 值，过滤后台小请求造成的波动</span>
+                </p>
                 <div style="display:flex; align-items:center; gap:12px;">
                   <input type="range" id="ringWindowSlider" min="5" max="120" value="15" step="5" style="flex:1;"
                     oninput="document.getElementById('ringWindowValue').textContent = this.value + 's'" />
@@ -561,8 +564,10 @@
               </div>
               <div
                 style="display:flex; gap:8px; justify-content:flex-end; padding-top:8px; border-top:1px solid var(--border, #27272a);">
-                <button class="action-btn" onclick="hideContextRingSettings()">取消</button>
-                <button class="action-btn primary" onclick="saveContextRingSettings()">保存</button>
+                <button class="action-btn" onclick="hideContextRingSettings()"><span
+                    id="ctxRingCancelBtn">取消</span></button>
+                <button class="action-btn primary" onclick="saveContextRingSettings()"><span
+                    id="ctxRingSaveBtn">保存</span></button>
               </div>
             </div>
           </div>
@@ -575,14 +580,15 @@
             style="background:var(--bg-card, #18181b); border:1px solid var(--border, #27272a); border-radius:12px; width:520px; max-width:92vw; max-height:80vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden;">
             <div
               style="padding:16px 20px; border-bottom:1px solid var(--border, #27272a); display:flex; justify-content:space-between; align-items:center;">
-              <span style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">🔗 AI 供应商</span>
+              <span id="provModalTitle" style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">🔗
+                AI 供应商</span>
               <div style="display:flex; gap:8px; align-items:center;">
                 <button class="action-btn-sm primary" onclick="showAddProviderForm();">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="12" y1="5" x2="12" y2="19" />
                     <line x1="5" y1="12" x2="19" y2="12" />
                   </svg>
-                  <span>添加</span>
+                  <span id="provModalAddBtn">添加</span>
                 </button>
                 <button onclick="hideProvidersModal()"
                   style="background:none; border:none; color:var(--text-secondary, #a1a1aa); font-size:20px; cursor:pointer; line-height:1;">✕</button>
@@ -602,7 +608,8 @@
           style="background:var(--bg-card, #18181b); border:1px solid var(--border, #27272a); border-radius:12px; width:440px; max-width:92vw; max-height:88vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.5); overflow:hidden;">
           <div
             style="padding:16px 20px; border-bottom:1px solid var(--border, #27272a); display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);"> 自动审批设置</span>
+            <span id="aaModalTitle" style="font-size:15px; font-weight:700; color:var(--text-primary, #fafafa);">
+              自动审批设置</span>
             <button onclick="closeAutoAcceptSettings()"
               style="background:none; border:none; color:var(--text-secondary, #a1a1aa); font-size:20px; cursor:pointer; line-height:1;">✕</button>
           </div>
@@ -610,25 +617,30 @@
             <div style="margin-bottom:18px;">
               <div
                 style="font-size:11px; color:var(--text-secondary, #a1a1aa); margin-bottom:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px;">
-                审批按钮类型</div>
+                <span id="aaPatternLabel">审批按钮类型</span>
+              </div>
               <div id="aaPatternGrid" style="display:grid; grid-template-columns:1fr 1fr; gap:7px;"></div>
             </div>
             <div>
               <div
                 style="font-size:11px; color:var(--text-secondary, #a1a1aa); margin-bottom:7px; font-weight:600; text-transform:uppercase; letter-spacing:0.6px;">
-                🛡️ 安全规则（每行一条，含关键词的命令不自动执行）</div>
+                <span id="aaBannedLabel">🛡️ 安全规则（每行一条，含关键词的命令不自动执行）</span>
+              </div>
               <textarea id="aaBannedInput" rows="7"
                 style="width:100%; background:var(--bg-input, #111113); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-primary, #fafafa); font-size:12px; font-family:monospace; padding:8px; resize:vertical; box-sizing:border-box; line-height:1.6;"></textarea>
               <button onclick="resetBannedCommands()"
-                style="margin-top:8px; padding:5px 12px; background:rgba(255,255,255,0.05); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-secondary, #a1a1aa); font-size:12px; cursor:pointer;">重置默认</button>
+                style="margin-top:8px; padding:5px 12px; background:rgba(255,255,255,0.05); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-secondary, #a1a1aa); font-size:12px; cursor:pointer;"><span
+                  id="aaResetBtn">重置默认</span></button>
             </div>
           </div>
           <div
             style="padding:12px 20px; border-top:1px solid var(--border, #27272a); display:flex; gap:8px; justify-content:flex-end;">
             <button onclick="closeAutoAcceptSettings()"
-              style="padding:8px 16px; background:rgba(255,255,255,0.06); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-secondary, #a1a1aa); font-size:13px; cursor:pointer;">取消</button>
+              style="padding:8px 16px; background:rgba(255,255,255,0.06); border:1px solid var(--border, #27272a); border-radius:6px; color:var(--text-secondary, #a1a1aa); font-size:13px; cursor:pointer;"><span
+                id="aaCancelBtn">取消</span></button>
             <button onclick="saveAutoAcceptSettings()"
-              style="padding:8px 16px; background:linear-gradient(135deg,#3b82f6,#2563eb); border:none; border-radius:6px; color:#fff; font-size:13px; cursor:pointer; font-weight:600;">保存设置</button>
+              style="padding:8px 16px; background:linear-gradient(135deg,#3b82f6,#2563eb); border:none; border-radius:6px; color:#fff; font-size:13px; cursor:pointer; font-weight:600;"><span
+                id="aaSaveBtn">保存设置</span></button>
           </div>
         </div>
       </div>
@@ -722,22 +734,7 @@
                 <button class="action-btn-sm danger" onclick="killPortProcess()" title="强制结束占用该端口的进程">释放端口</button>
               </div>
             </div>
-            <div class="setting-item">
-              <div class="setting-info">
-                <span class="setting-label" id="settOfficialLsLabel">官方 LS 转发</span>
-                <span class="setting-desc" id="settOfficialLsDesc">通过官方 Language Server 转发请求到 Google Cloud（推荐开启）</span>
-              </div>
-              <div class="setting-control">
-                <label class="toggle-switch">
-                  <input type="checkbox" id="officialLsToggle" checked onchange="onOfficialLsToggle(this.checked)">
-                  <span class="toggle-slider"></span>
-                </label>
-              </div>
-            </div>
-            <div id="officialLsInfoPanel" style="padding:0 16px 16px 16px;">
-              <div class="form-hint" id="officialLsStatus" style="margin-top:4px;">LS 状态：未检查</div>
-              <div class="form-hint" id="officialLsBinaryInfo" style="margin-top:4px;">二进制文件：未检测</div>
-            </div>
+            <!-- 官方 LS 转发已移除 -->
             <div class="setting-item" style="flex-direction:column; align-items:stretch;">
               <div style="display:flex; align-items:center; justify-content:space-between; gap:16px;">
                 <div class="setting-info">
@@ -764,19 +761,6 @@
                     </button>
                   </div>
                 </div>
-              </div>
-            </div>
-            <div class="setting-item">
-              <div class="setting-info">
-                <span class="setting-label" id="settCapacityLabel">模型互补</span>
-                <span class="setting-desc" id="settCapacityDesc">仅针对 opus/sonnet thinking 自动重试并互切</span>
-              </div>
-              <div class="setting-control">
-                <label class="toggle-switch">
-                  <input type="checkbox" id="capacityFailoverToggle" onchange="onCapacityFailoverChange(this.checked)"
-                    checked>
-                  <span class="toggle-slider"></span>
-                </label>
               </div>
             </div>
             <div class="setting-item" style="flex-direction:column; align-items:stretch;">

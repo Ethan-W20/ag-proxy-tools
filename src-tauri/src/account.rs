@@ -4,10 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{Emitter, State};
 
-use crate::constants::{get_client_secret, AUTH_URL, CLIENT_ID, TOKEN_URL, USERINFO_URL};
-use crate::models::{Account, AppState};
+use crate::constants::{get_client_id, get_client_secret, AUTH_URL, TOKEN_URL, USERINFO_URL};
+use crate::models::{Account, AppState, QuotaErrorInfo};
 use crate::proxy::do_refresh_token;
-use crate::utils::{emit_log, get_app_data_dir};
+use crate::utils::emit_log;
 
 #[derive(Clone, serde::Serialize)]
 struct AccountLoadProgressPayload {
@@ -18,10 +18,81 @@ struct AccountLoadProgressPayload {
     run_id: u64,
 }
 
+const PRIMARY_ACCOUNT_DATA_DIR: &str = ".antigravity_proxy_tools";
+const PRIMARY_ACCOUNTS_DIR: &str = "account";
+
+fn get_home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn get_accounts_dir() -> PathBuf {
-    let dir = get_app_data_dir().join("accounts");
+    let dir = get_home_dir()
+        .join(PRIMARY_ACCOUNT_DATA_DIR)
+        .join(PRIMARY_ACCOUNTS_DIR);
     fs::create_dir_all(&dir).ok();
     dir
+}
+
+fn get_legacy_accounts_dirs() -> Vec<PathBuf> {
+    let home = get_home_dir();
+    vec![
+        home.join(".antigravity_tools").join("accounts"),
+        home.join(".antigravity_cockpit").join("accounts"),
+        home.join(".antigravity_proxy_manager").join("account"),
+        home.join(".antigravity_proxy_manager").join("accounts"),
+    ]
+}
+
+fn get_accounts_read_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+
+    for dir in std::iter::once(get_accounts_dir()).chain(get_legacy_accounts_dirs()) {
+        if seen.insert(dir.clone()) {
+            dirs.push(dir);
+        }
+    }
+
+    dirs
+}
+
+fn collect_json_files_from_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let mut dir_paths: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                dir_paths.push(path);
+            }
+        }
+        dir_paths.sort();
+        for path in dir_paths {
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths
+}
+
+fn collect_primary_account_files() -> Vec<PathBuf> {
+    let primary = get_accounts_dir();
+    collect_json_files_from_dirs(&[primary])
+}
+
+fn collect_legacy_account_files() -> Vec<PathBuf> {
+    let legacy = get_legacy_accounts_dirs();
+    collect_json_files_from_dirs(&legacy)
 }
 
 fn save_account_to_disk(account: &Account) -> Result<(), String> {
@@ -47,10 +118,48 @@ pub(crate) fn persist_account(account: &Account) -> Result<(), String> {
     save_account_to_disk(account)
 }
 
+fn parse_quota_error_from_json(json: &serde_json::Value) -> Option<QuotaErrorInfo> {
+    let quota_error = json.get("quota_error")?;
+    if quota_error.is_null() {
+        return None;
+    }
+
+    let message = quota_error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        return None;
+    }
+
+    let kind = quota_error
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let code = quota_error
+        .get("code")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u16::try_from(v).ok());
+    let timestamp = quota_error
+        .get("timestamp")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| Utc::now().timestamp());
+
+    Some(QuotaErrorInfo {
+        kind,
+        code,
+        message,
+        timestamp,
+    })
+}
+
 fn delete_account_from_disk(email: &str) {
-    let dir = get_accounts_dir();
     let file_name = format!("{}.json", email.replace("@", "_at_"));
-    let _ = fs::remove_file(dir.join(file_name));
+    for dir in get_accounts_read_dirs() {
+        let _ = fs::remove_file(dir.join(&file_name));
+    }
 }
 
 fn parse_account_from_json(json: &serde_json::Value, fallback_email: &str) -> Option<Account> {
@@ -98,6 +207,10 @@ fn parse_account_from_json(json: &serde_json::Value, fallback_email: &str) -> Op
     } else {
         raw_expiry
     };
+    let disabled = json
+        .get("disabled")
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
 
     Some(Account {
         id: json
@@ -109,50 +222,47 @@ fn parse_account_from_json(json: &serde_json::Value, fallback_email: &str) -> Op
         refresh_token,
         access_token,
         expiry_timestamp: expiry,
-        disabled: json
-            .get("disabled")
-            .and_then(|d| d.as_bool())
-            .unwrap_or(false),
-        disabled_reason: json
-            .get("disabled_reason")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        disabled_at: json.get("disabled_at").and_then(|v| v.as_i64()),
-        quota_error: json
-            .get("quota_error")
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        disabled,
+        disabled_reason: if disabled {
+            json.get("disabled_reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        },
+        disabled_at: if disabled {
+            json.get("disabled_at").and_then(|v| v.as_i64())
+        } else {
+            None
+        },
+        quota_error: parse_quota_error_from_json(json),
     })
 }
-
 #[tauri::command]
 pub fn load_credentials(state: State<'_, AppState>) -> Result<Vec<Account>, String> {
-    let dir = get_accounts_dir();
     let mut all_accounts = Vec::new();
+    let mut seen_emails = HashSet::new();
 
-    if dir.exists() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let content = match fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let json: serde_json::Value = match serde_json::from_str(&content) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let fallback = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .replace("_at_", "@");
-                if let Some(acc) = parse_account_from_json(&json, &fallback) {
-                    all_accounts.push(acc);
-                }
+    for path in collect_primary_account_files() {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let fallback = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .replace("_at_", "@");
+        if let Some(acc) = parse_account_from_json(&json, &fallback) {
+            if !seen_emails.insert(acc.email.clone()) {
+                continue;
             }
+            all_accounts.push(acc);
         }
     }
 
@@ -192,19 +302,7 @@ pub fn load_credentials_stream(
             },
         );
 
-        let dir = get_accounts_dir();
-        let mut paths: Vec<PathBuf> = Vec::new();
-        if dir.exists() {
-            if let Ok(entries) = fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                        paths.push(path);
-                    }
-                }
-            }
-        }
-        paths.sort();
+        let paths: Vec<PathBuf> = collect_primary_account_files();
         let total = paths.len();
         let _ = app.emit(
             "accounts-load-progress",
@@ -281,7 +379,7 @@ pub fn load_credentials_stream(
 pub fn switch_account(index: i32, state: State<'_, AppState>) -> Result<String, String> {
     let accounts = state.accounts.lock().unwrap();
     if index < 0 || index >= accounts.len() as i32 {
-        return Err("无效的账号索引".to_string());
+        return Err("invalid account index".to_string());
     }
     drop(accounts);
     *state.current_idx.lock().unwrap() = index;
@@ -292,7 +390,7 @@ pub fn switch_account(index: i32, state: State<'_, AppState>) -> Result<String, 
 pub fn delete_account(index: i32, state: State<'_, AppState>) -> Result<String, String> {
     let mut accounts = state.accounts.lock().unwrap();
     if index < 0 || index >= accounts.len() as i32 {
-        return Err("无效的账号索引".to_string());
+        return Err("invalid account index".to_string());
     }
     let removed = accounts.remove(index as usize);
     delete_account_from_disk(&removed.email);
@@ -315,12 +413,12 @@ pub fn toggle_account_disabled(
 ) -> Result<Vec<Account>, String> {
     let mut accounts = state.accounts.lock().unwrap();
     if index < 0 || index >= accounts.len() as i32 {
-        return Err("无效的账号索引".to_string());
+        return Err("invalid account index".to_string());
     }
     let account = &mut accounts[index as usize];
     account.disabled = disabled;
     if disabled {
-        account.disabled_reason = Some("手动禁用".to_string());
+        account.disabled_reason = Some("鎵嬪姩绂佺敤".to_string());
         account.disabled_at = Some(Utc::now().timestamp());
     } else {
         account.disabled_reason = None;
@@ -377,7 +475,7 @@ fn import_single_json_file(
                     );
                     continue;
                 }
-                emit_log(app, &format!("已导入: {}", acc.email), "success", None);
+                emit_log(app, &format!("已导入 {}", acc.email), "success", None);
                 state.accounts.lock().unwrap().push(acc);
                 any_imported = true;
             }
@@ -410,7 +508,7 @@ fn import_single_json_file(
                     );
                     continue;
                 }
-                emit_log(app, &format!("已导入: {}", acc.email), "success", None);
+                emit_log(app, &format!("已导入 {}", acc.email), "success", None);
                 state.accounts.lock().unwrap().push(acc);
                 any_imported = true;
             }
@@ -481,6 +579,79 @@ pub fn import_credential_files(
 }
 
 #[tauri::command]
+pub fn sync_accounts_from_legacy_projects(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<i32, String> {
+    let legacy_files = collect_legacy_account_files();
+    if legacy_files.is_empty() {
+        emit_log(&app, "No legacy project accounts found", "info", None);
+        return Ok(0);
+    }
+
+    let mut existing_emails: HashSet<String> = {
+        let accounts = state.accounts.lock().unwrap();
+        accounts.iter().map(|a| a.email.clone()).collect()
+    };
+    let mut new_accounts: Vec<Account> = Vec::new();
+
+    for path in legacy_files {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let fallback = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .replace("_at_", "@");
+        let Some(account) = parse_account_from_json(&json, &fallback) else {
+            continue;
+        };
+        if !existing_emails.insert(account.email.clone()) {
+            continue;
+        }
+        new_accounts.push(account);
+    }
+
+    if new_accounts.is_empty() {
+        emit_log(&app, "No new accounts to sync from other projects", "info", None);
+        return Ok(0);
+    }
+
+    let imported = new_accounts.len() as i32;
+
+    for account in &new_accounts {
+        let _ = save_account_to_disk(account);
+    }
+
+    {
+        let mut accounts = state.accounts.lock().unwrap();
+        accounts.extend(new_accounts);
+        accounts.sort_by(|a, b| a.email.cmp(&b.email));
+    }
+
+    if *state.current_idx.lock().unwrap() < 0 {
+        let has_accounts = !state.accounts.lock().unwrap().is_empty();
+        if has_accounts {
+            *state.current_idx.lock().unwrap() = 0;
+        }
+    }
+
+    emit_log(
+        &app,
+        &format!("Synced {} account(s) from other projects", imported),
+        "success",
+        None,
+    );
+    Ok(imported)
+}
+
+#[tauri::command]
 pub async fn import_refresh_token(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -501,31 +672,36 @@ pub async fn import_refresh_token(
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| format!("获取用户信息失败: {}", e))?;
+        .map_err(|e| format!("鑾峰彇鐢ㄦ埛淇℃伅澶辫触: {}", e))?;
     if !resp.status().is_success() {
         return Err(format!(
-            "获取用户信息失败: {}",
+            "鑾峰彇鐢ㄦ埛淇℃伅澶辫触: {}",
             resp.text().await.unwrap_or_default()
         ));
     }
-    let user_info: serde_json::Value = resp.json().await.map_err(|e| format!("解析失败: {}", e))?;
+    let user_info: serde_json::Value = resp.json().await.map_err(|e| format!("瑙ｆ瀽澶辫触: {}", e))?;
     let email = user_info
         .get("email")
         .and_then(|e| e.as_str())
-        .ok_or("无法获取 email")?
+        .ok_or("鏃犳硶鑾峰彇 email")?
         .to_string();
 
     {
         let accounts = state.accounts.lock().unwrap();
         if accounts.iter().any(|a| a.email == email) {
-            return Err(format!("账号 {} 已存在", email));
+            return Err(format!("account {} already exists", email));
         }
     }
 
     let project_id = match crate::proxy::fetch_project_resource_with_token(&access_token).await {
         Some(resource) => resource.strip_prefix("projects/").unwrap_or(&resource).to_string(),
         None => {
-            crate::utils::emit_log(&app, "导入账号：未能自动获取 project ID，将在首次请求时重试", "warning", None);
+            crate::utils::emit_log(
+                &app,
+                "Import: could not auto-detect project ID, will retry on first request",
+                "warning",
+                None,
+            );
             String::new()
         }
     };
@@ -551,7 +727,7 @@ pub async fn import_refresh_token(
         *state.current_idx.lock().unwrap() = 0;
     }
 
-    emit_log(&app, &format!("账号导入成功: {}", email), "success", None);
+    emit_log(&app, &format!("璐﹀彿瀵煎叆鎴愬姛: {}", email), "success", None);
     Ok(email)
 }
 
@@ -561,11 +737,12 @@ pub async fn start_oauth_login(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let redirect_uri = "http://localhost:19876/callback";
+    let client_id = get_client_id()?;
     let scopes = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
     let auth_url = url::Url::parse_with_params(
         AUTH_URL,
         &[
-            ("client_id", CLIENT_ID),
+            ("client_id", client_id.as_str()),
             ("redirect_uri", redirect_uri),
             ("response_type", "code"),
             ("scope", scopes),
@@ -581,22 +758,22 @@ pub async fn start_oauth_login(
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:19876")
         .await
-        .map_err(|e| format!("无法启动回调服务: {}", e))?;
-    emit_log(&app, "等待授权回调 (120 秒超时)...", "info", None);
+        .map_err(|e| format!("鏃犳硶鍚姩鍥炶皟鏈嶅姟: {}", e))?;
+    emit_log(&app, "绛夊緟鎺堟潈鍥炶皟 (120 绉掕秴鏃?...", "info", None);
 
     let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(120), listener.accept())
         .await
-        .map_err(|_| "OAuth 授权超时".to_string())?
-        .map_err(|e| format!("连接失败: {}", e))?;
+        .map_err(|_| "OAuth 鎺堟潈瓒呮椂".to_string())?
+        .map_err(|e| format!("杩炴帴澶辫触: {}", e))?;
 
     let mut buf = vec![0u8; 4096];
     stream
         .readable()
         .await
-        .map_err(|e| format!("读取失败: {}", e))?;
+        .map_err(|e| format!("璇诲彇澶辫触: {}", e))?;
     let n = stream
         .try_read(&mut buf)
-        .map_err(|e| format!("读取失败: {}", e))?;
+        .map_err(|e| format!("璇诲彇澶辫触: {}", e))?;
     let request = String::from_utf8_lossy(&buf[..n]).to_string();
 
     let code = request
@@ -616,9 +793,9 @@ pub async fn start_oauth_login(
                 None
             }
         })
-        .ok_or("未获取到 authorization code")?;
+        .ok_or("鏈幏鍙栧埌 authorization code")?;
 
-    let resp_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h1>授权成功！</h1><p>可以关闭此页面了</p></body></html>";
+    let resp_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h1>Authorization successful</h1><p>You can close this window now.</p></body></html>";
     stream.writable().await.ok();
     let _ = stream.try_write(resp_html.as_bytes());
     drop(stream);
@@ -629,7 +806,7 @@ pub async fn start_oauth_login(
     let token_resp = client
         .post(TOKEN_URL)
         .form(&[
-            ("client_id", CLIENT_ID),
+            ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
             ("code", code.as_str()),
             ("redirect_uri", redirect_uri),
@@ -637,27 +814,27 @@ pub async fn start_oauth_login(
         ])
         .send()
         .await
-        .map_err(|e| format!("Token 交换失败: {}", e))?;
+        .map_err(|e| format!("Token 浜ゆ崲澶辫触: {}", e))?;
 
     if !token_resp.status().is_success() {
         return Err(format!(
-            "Token 交换失败: {}",
+            "Token 浜ゆ崲澶辫触: {}",
             token_resp.text().await.unwrap_or_default()
         ));
     }
     let td: serde_json::Value = token_resp
         .json()
         .await
-        .map_err(|e| format!("解析失败: {}", e))?;
+        .map_err(|e| format!("瑙ｆ瀽澶辫触: {}", e))?;
     let access_token = td
         .get("access_token")
         .and_then(|a| a.as_str())
-        .ok_or("缺少 access_token")?
+        .ok_or("缂哄皯 access_token")?
         .to_string();
     let refresh_token = td
         .get("refresh_token")
         .and_then(|r| r.as_str())
-        .ok_or("缺少 refresh_token")?
+        .ok_or("缂哄皯 refresh_token")?
         .to_string();
     let expiry = Utc::now().timestamp()
         + td.get("expires_in")
@@ -669,28 +846,33 @@ pub async fn start_oauth_login(
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|e| format!("获取用户信息失败: {}", e))?;
+        .map_err(|e| format!("鑾峰彇鐢ㄦ埛淇℃伅澶辫触: {}", e))?;
     let ui: serde_json::Value = user_resp
         .json()
         .await
-        .map_err(|e| format!("解析失败: {}", e))?;
+        .map_err(|e| format!("瑙ｆ瀽澶辫触: {}", e))?;
     let email = ui
         .get("email")
         .and_then(|e| e.as_str())
-        .ok_or("缺少 email")?
+        .ok_or("缂哄皯 email")?
         .to_string();
 
     {
         let accounts = state.accounts.lock().unwrap();
         if accounts.iter().any(|a| a.email == email) {
-            return Err(format!("账号 {} 已存在", email));
+            return Err(format!("account {} already exists", email));
         }
     }
 
     let project_id = match crate::proxy::fetch_project_resource_with_token(&access_token).await {
         Some(resource) => resource.strip_prefix("projects/").unwrap_or(&resource).to_string(),
         None => {
-            crate::utils::emit_log(&app, "OAuth 登录：未能自动获取 project ID，将在首次请求时重试", "warning", None);
+            crate::utils::emit_log(
+                &app,
+                "OAuth: could not auto-detect project ID, will retry on first request",
+                "warning",
+                None,
+            );
             String::new()
         }
     };
@@ -716,6 +898,6 @@ pub async fn start_oauth_login(
         *state.current_idx.lock().unwrap() = 0;
     }
 
-    emit_log(&app, &format!("OAuth 登录成功: {}", email), "success", None);
+    emit_log(&app, &format!("OAuth 鐧诲綍鎴愬姛: {}", email), "success", None);
     Ok(email)
 }
